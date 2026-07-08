@@ -1,0 +1,475 @@
+# Shopify + Next.js Integration Guide
+
+This guide covers integrating Shopify's Storefront and Admin APIs into a Next.js 14 App Router project with full CRUD capabilities, image uploads, and a shadcn/ui frontend.
+
+---
+
+## 1. Prerequisites
+
+- **Node.js** 18+ and **npm**
+- A **Shopify store** (create a [development store](https://help.shopify.com/en/partners/dashboard/managing-stores/development-stores) for testing)
+- A Shopify Partners account (to generate Admin API tokens)
+
+---
+
+## 2. Project Setup
+
+```bash
+npx create-next-app@latest my-shopify-app --typescript --app-router
+cd my-shopify-app
+```
+
+Install Tailwind CSS and shadcn/ui:
+
+```bash
+npm install tailwindcss@3 postcss autoprefixer class-variance-authority clsx tailwind-merge tailwindcss-animate lucide-react @radix-ui/react-slot @radix-ui/react-label @radix-ui/react-alert-dialog
+```
+
+Create `tailwind.config.ts`, `postcss.config.js`, and `src/lib/utils.ts` per [shadcn/ui manual setup](https://ui.shadcn.com/docs/installation/manual). Then add UI components (`button`, `card`, `input`, `textarea`, `label`, `alert-dialog`) under `src/components/ui/`.
+
+---
+
+## 3. Environment Variables
+
+Create `.env.local` in the project root:
+
+```
+SHOPIFY_STORE_DOMAIN=your-store.myshopify.com
+SHOPIFY_STOREFRONT_ACCESS_TOKEN=your-storefront-token
+SHOPIFY_ADMIN_ACCESS_TOKEN=your-admin-token
+```
+
+### Where to find each token
+
+| Token                    | Location in Shopify Admin                                                                 |
+|--------------------------|-------------------------------------------------------------------------------------------|
+| Storefront API token     | **Settings → Sales channels → Shopfront → API → Storefront API access tokens**            |
+| Admin API token          | **Apps → Develop apps → Create an app → Admin API → Configure scopes → Issue token**      |
+
+> **Admin API scopes needed**: `read_products`, `write_products`, `read_product_listings`, `write_product_listings`
+
+---
+
+## 4. Storefront API Client (`src/lib/shopify.ts`)
+
+The Storefront API is public-facing and used for read-only product queries on a storefront.
+
+```typescript
+const SHOPIFY_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN!
+const STOREFRONT_TOKEN = process.env.SHOPIFY_STOREFRONT_ACCESS_TOKEN!
+const API_VERSION = "2024-10"
+const endpoint = `https://${SHOPIFY_DOMAIN}/api/${API_VERSION}/graphql.json`
+
+type ShopifyResponse<T> = { data: T }
+
+export async function shopifyFetch<T>({
+  query,
+  variables,
+  tags,
+}: {
+  query: string
+  variables?: Record<string, unknown>
+  tags?: string[]
+}): Promise<T> {
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Storefront-Access-Token": STOREFRONT_TOKEN,
+    },
+    body: JSON.stringify({ query, variables }),
+    next: { tags },     // Next.js data cache tags
+  })
+  if (!res.ok) throw new Error(`Shopify API error: ${res.status}`)
+  const body: ShopifyResponse<T> = await res.json()
+  return body.data
+}
+```
+
+### When to use the Storefront API
+
+- Product detail and listing pages on a **public storefront**
+- You only need **read** access
+- The API token has `write_publications` scope (so new products appear)
+
+### Limitations
+
+- Products created via the Admin API may **not appear** if the Storefront API token lacks `write_publications` scope
+- Only supports `query` and `productByHandle` queries — no mutations
+
+---
+
+## 5. Admin API Client (`src/lib/shopify-admin.ts`)
+
+The Admin API is the recommended approach for building an **admin panel** with full CRUD.
+
+```typescript
+const SHOPIFY_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN!
+const ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN!
+const API_VERSION = "2024-10"
+const endpoint = `https://${SHOPIFY_DOMAIN}/admin/api/${API_VERSION}/graphql.json`
+
+type ShopifyAdminResponse<T> = { data: T }
+
+export async function shopifyAdminFetch<T>({
+  query,
+  variables,
+}: {
+  query: string
+  variables?: Record<string, unknown>
+}): Promise<T> {
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": ADMIN_TOKEN,
+    },
+    body: JSON.stringify({ query, variables }),
+    cache: "no-store",     // required — otherwise responses are stale
+  })
+  if (!res.ok) throw new Error(`Shopify Admin API error: ${res.status}`)
+  const body: ShopifyAdminResponse<T> = await res.json()
+  if ("errors" in (body as any)) throw new Error(JSON.stringify((body as any).errors))
+  return body.data
+}
+```
+
+> **⚠️ Important**: Always use `cache: "no-store"` on Admin API fetches. Next.js `force-dynamic` on the page alone is **not sufficient** — the `fetch` itself will cache.
+
+### Key GraphQL Queries & Mutations
+
+```typescript
+// List active products
+export const ADMIN_PRODUCTS_QUERY = `#graphql
+  query AdminProducts {
+    products(first: 50, query: "status:ACTIVE") {
+      nodes {
+        id, handle, title, descriptionHtml, status
+        featuredImage { url, altText, width, height }
+        priceRangeV2: priceRange {
+          minVariantPrice { amount, currencyCode }
+          maxVariantPrice { amount, currencyCode }
+        }
+        variants(first: 1) {
+          nodes { id, title, price }
+        }
+      }
+    }
+  }
+`
+
+// Single product by handle
+export const ADMIN_PRODUCT_QUERY = `#graphql
+  query AdminProduct($handle: String!) {
+    productByHandle(handle: $handle) {
+      id, handle, title, descriptionHtml, status
+      featuredImage { url, altText, width, height }
+      priceRangeV2: priceRange {
+        minVariantPrice { amount, currencyCode }
+        maxVariantPrice { amount, currencyCode }
+      }
+      variants(first: 50) {
+        nodes { id, title, price }
+      }
+    }
+  }
+`
+
+// Create product
+export const CREATE_PRODUCT_MUTATION = `#graphql
+  mutation CreateProduct($input: ProductInput!) {
+    productCreate(input: $input) {
+      product { id, title, handle, descriptionHtml }
+      userErrors { field, message }
+    }
+  }
+`
+
+// Update title/description
+export const UPDATE_PRODUCT_MUTATION = `#graphql
+  mutation UpdateProduct($input: ProductInput!) {
+    productUpdate(input: $input) {
+      product { id, title, handle, descriptionHtml }
+      userErrors { field, message }
+    }
+  }
+`
+
+// Update variant price
+export const UPDATE_VARIANT_MUTATION = `#graphql
+  mutation UpdateVariant($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+    productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+      productVariants { id, title, price }
+      userErrors { field, message }
+    }
+  }
+`
+
+// Delete product
+export const DELETE_PRODUCT_MUTATION = `#graphql
+  mutation DeleteProduct($input: ProductDeleteInput!) {
+    productDelete(input: $input) {
+      deletedProductId
+      userErrors { field, message }
+    }
+  }
+`
+```
+
+---
+
+## 6. API Routes
+
+All routes live under `src/app/api/products/`.
+
+### GET /api/products?handle=
+
+Fetches product data for the edit form.
+
+```typescript
+// src/app/api/products/route.ts
+export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url)
+  const handle = searchParams.get("handle")
+  if (!handle) return NextResponse.json({ error: "handle required" }, { status: 400 })
+
+  const { productByHandle } = await shopifyAdminFetch<AdminProductResponse>({
+    query: ADMIN_PRODUCT_QUERY,
+    variables: { handle },
+  })
+  if (!productByHandle) return NextResponse.json({ error: "Not found" }, { status: 404 })
+
+  const numericId = productByHandle.id.split("/").pop()
+  const price = productByHandle.variants.nodes[0]?.price
+
+  return NextResponse.json({
+    numericId,
+    title: productByHandle.title,
+    descriptionHtml: productByHandle.descriptionHtml,
+    price,
+  })
+}
+```
+
+### POST /api/products
+
+Creates a product and optionally attaches an image.
+
+```typescript
+export async function POST(request: Request) {
+  const { title, descriptionHtml, variants, imageUrl } = await request.json()
+
+  const result = await shopifyAdminFetch({ query: CREATE_PRODUCT_MUTATION, variables: { input: { title, descriptionHtml: descriptionHtml || "", status: "ACTIVE" } } })
+  const product = result.productCreate.product
+
+  // Optional: image upload via REST API
+  if (imageUrl) {
+    const numericId = product.id.split("/").pop()
+    await fetch(`https://${domain}/admin/api/2024-10/products/${numericId}/images.json`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": token },
+      body: JSON.stringify({ image: { src: imageUrl } }),
+    })
+  }
+
+  // Optional: set initial price
+  const price = variants?.[0]?.price
+  if (price) {
+    const { product: p } = await shopifyAdminFetch({ query: PRODUCT_VARIANTS_QUERY, variables: { productId: product.id } })
+    const variantId = p?.variants?.nodes?.[0]?.id
+    if (variantId) {
+      await shopifyAdminFetch({ query: UPDATE_VARIANT_MUTATION, variables: { productId: product.id, variants: [{ id: variantId, price: String(price) }] } })
+    }
+  }
+
+  return NextResponse.json({ product }, { status: 201 })
+}
+```
+
+> **Image upload**: Shopify's GraphQL Admin API has limited image support for mutations. Use the REST endpoint `/admin/api/{version}/products/{id}/images.json` instead.
+
+### PUT /api/products/[id]
+
+Updates title, description, and optionally the variant price.
+
+```typescript
+export async function PUT(request: Request, { params }: { params: { id: string } }) {
+  const { title, descriptionHtml, price } = await request.json()
+  const id = `gid://shopify/Product/${params.id}`
+
+  // Update product metadata
+  const { productUpdate } = await shopifyAdminFetch({ query: UPDATE_PRODUCT_MUTATION, variables: { input: { id, title, descriptionHtml: descriptionHtml || "" } } })
+
+  // Update variant price if changed (only updates first variant)
+  if (price !== undefined && price !== "") {
+    const { product: existing } = await shopifyAdminFetch({ query: PRODUCT_VARIANTS_QUERY, variables: { productId: id } })
+    const variantId = existing?.variants?.nodes?.[0]?.id
+    if (variantId) {
+      const varResult = await shopifyAdminFetch({ query: UPDATE_VARIANT_MUTATION, variables: { productId: id, variants: [{ id: variantId, price: String(price) }] } })
+      if (varResult.productVariantsBulkUpdate.userErrors.length > 0) {
+        return NextResponse.json({ error: varResult.productVariantsBulkUpdate.userErrors.map(e => e.message).join(", ") }, { status: 400 })
+      }
+    }
+  }
+
+  return NextResponse.json({ product: productUpdate.product })
+}
+```
+
+### DELETE /api/products/[id]
+
+```typescript
+export async function DELETE(request: Request, { params }: { params: { id: string } }) {
+  const id = `gid://shopify/Product/${params.id}`
+  const { productDelete } = await shopifyAdminFetch({ query: DELETE_PRODUCT_MUTATION, variables: { input: { id } } })
+  if (productDelete.userErrors.length > 0) {
+    return NextResponse.json({ error: productDelete.userErrors.map(e => e.message).join(", ") }, { status: 400 })
+  }
+  return NextResponse.json({ deleted: true })
+}
+```
+
+---
+
+## 7. TypeScript Types (`src/lib/types.ts`)
+
+```typescript
+export type ShopifyImage = {
+  url: string
+  altText: string | null
+  width: number
+  height: number
+}
+
+// Admin API product shape
+export type AdminProduct = {
+  id: string
+  handle: string
+  title: string
+  descriptionHtml: string
+  status: string
+  featuredImage: ShopifyImage | null
+  priceRangeV2: {
+    minVariantPrice: { amount: string; currencyCode: string }
+    maxVariantPrice: { amount: string; currencyCode: string }
+  }
+  variants: {
+    nodes: Array<{ id: string; title: string; price: string }>
+  }
+}
+
+export type AdminProductsResponse = { products: { nodes: AdminProduct[] } }
+export type AdminProductResponse = { productByHandle: AdminProduct | null }
+```
+
+---
+
+## 8. Frontend Pages
+
+All pages use `force-dynamic` to avoid serving stale data.
+
+| Page                                         | Type              | Description                        |
+|-----------------------------------------------|-------------------|------------------------------------|
+| `/`                                           | Server Component  | Product grid with Cards             |
+| `/products/[handle]`                          | Server Component  | Product detail, Edit/Delete buttons |
+| `/products/add`                               | Client Component  | Form to create a product            |
+| `/products/[handle]/edit`                     | Client Component  | Pre-filled edit form                |
+
+### Homepage (`src/app/page.tsx`)
+
+```tsx
+export const dynamic = "force-dynamic"
+
+export default async function Home() {
+  const { products } = await shopifyAdminFetch<AdminProductsResponse>({ query: ADMIN_PRODUCTS_QUERY })
+  return (
+    <main className="mx-auto max-w-7xl px-4 py-8">
+      <div className="flex items-center justify-between mb-8">
+        <h1 className="text-3xl font-bold">Products</h1>
+        <Link href="/products/add"><Button>+ Add Product</Button></Link>
+      </div>
+      <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+        {products.nodes.map(product => <ProductCard key={product.id} product={product} />)}
+      </div>
+    </main>
+  )
+}
+```
+
+### Product Card (`src/components/ProductCard.tsx`)
+
+```tsx
+export default function ProductCard({ product }: { product: AdminProduct }) {
+  const variantPrice = product.variants.nodes[0]?.price ?? "0"
+  const currencyCode = product.priceRangeV2.minVariantPrice.currencyCode
+  const formattedPrice = new Intl.NumberFormat("en-US", { style: "currency", currency: currencyCode }).format(Number(variantPrice))
+
+  return (
+    <Card className="overflow-hidden transition-shadow hover:shadow-md">
+      {product.featuredImage && (
+        <div className="aspect-square overflow-hidden">
+          <img src={product.featuredImage.url} alt={product.featuredImage.altText ?? product.title} className="h-full w-full object-cover hover:scale-105 transition-transform" />
+        </div>
+      )}
+      <CardContent className="p-4">
+        <h2 className="text-lg font-semibold">{product.title}</h2>
+        <p className="text-sm text-muted-foreground mt-1">{formattedPrice}</p>
+      </CardContent>
+    </Card>
+  )
+}
+```
+
+---
+
+## 9. Known Pitfalls
+
+### 9.1. `priceRangeV2` is stale after variant price update
+
+Shopify's `priceRangeV2` (alias for `priceRange`) does **not** immediately reflect changes made via `productVariantsBulkUpdate`. Always read the price from `variants.nodes[0].price` for display.
+
+```
+// ❌ BAD — shows stale data
+priceRangeV2.minVariantPrice.amount
+
+// ✅ GOOD — shows actual variant price
+variants.nodes[0]?.price
+```
+
+### 9.2. Admin API responses are cached by Next.js
+
+Even with `export const dynamic = "force-dynamic"` on the page, `fetch` calls are cached. Always pass `cache: "no-store"` to the fetch options in your Admin API client.
+
+### 9.3. New products don't appear in Storefront API
+
+The Storefront API requires the API token to have the `write_publications` scope and the product must be published to a sales channel. Using the Admin API avoids this issue entirely.
+
+### 9.4. Image upload requires REST, not GraphQL
+
+The GraphQL Admin API mutation `productCreateMedia` is unreliable for initial product creation. Use the REST endpoint:
+
+```
+POST /admin/api/{version}/products/{id}/images.json
+Body: { "image": { "src": "https://..." } }
+```
+
+---
+
+## 10. Running the App
+
+```bash
+npm run dev       # Development — http://localhost:3000
+npm run build     # Production build
+npm start         # Serve production build
+```
+
+---
+
+## 11. Quick Reference
+
+- [Shopify Admin API GraphQL reference](https://shopify.dev/docs/api/admin-graphql)
+- [Shopify Storefront API GraphQL reference](https://shopify.dev/docs/api/storefront-graphql)
+- [shadcn/ui components](https://ui.shadcn.com/docs/components)
+- GraphQL endpoint formats:
+  - Storefront: `https://{domain}/api/{version}/graphql.json`
+  - Admin: `https://{domain}/admin/api/{version}/graphql.json`
