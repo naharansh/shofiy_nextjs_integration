@@ -9,12 +9,21 @@ import { Textarea } from "@/components/ui/textarea"
 import { Label } from "@/components/ui/label"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 
+const platforms = [
+  { value: "shopify", label: "Shopify" },
+  { value: "woocommerce", label: "WooCommerce" },
+  { value: "odoo", label: "Odoo" },
+] as const
+
+type Platform = (typeof platforms)[number]["value"]
+
 export default function AddProductPage() {
   const router = useRouter()
   const [title, setTitle] = useState("")
   const [description, setDescription] = useState("")
   const [price, setPrice] = useState("")
   const [imageUrl, setImageUrl] = useState("")
+  const [platform, setPlatform] = useState<Platform>("shopify")
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState("")
 
@@ -33,6 +42,7 @@ export default function AddProductPage() {
           variants: [{ price: price || undefined }],
           imageUrl: imageUrl || undefined,
           imageAlt: title,
+          platform,
         }),
       })
 
@@ -43,7 +53,7 @@ export default function AddProductPage() {
         return
       }
 
-      router.push(`/products/${data.product.handle}`)
+      router.push("/")
     } catch {
       setError("Something went wrong")
     } finally {
@@ -66,6 +76,26 @@ export default function AddProductPage() {
         </CardHeader>
         <CardContent>
           <form onSubmit={handleSubmit} className="space-y-4">
+            <div className="space-y-2">
+              <Label>Platform</Label>
+              <div className="flex gap-2">
+                {platforms.map((p) => (
+                  <button
+                    key={p.value}
+                    type="button"
+                    onClick={() => setPlatform(p.value)}
+                    className={`flex-1 rounded-lg border-2 px-4 py-2 text-sm font-medium transition-colors ${
+                      platform === p.value
+                        ? "border-primary bg-primary/10 text-primary"
+                        : "border-input bg-background text-muted-foreground hover:border-muted-foreground"
+                    }`}
+                  >
+                    {p.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
             <div className="space-y-2">
               <Label htmlFor="title">Title *</Label>
               <Input
@@ -117,7 +147,9 @@ export default function AddProductPage() {
             )}
 
             <Button type="submit" disabled={submitting} className="w-full">
-              {submitting ? "Creating..." : "Create Product"}
+              {submitting
+                ? "Creating..."
+                : `Create on ${platforms.find((p) => p.value === platform)?.label}`}
             </Button>
           </form>
         </CardContent>

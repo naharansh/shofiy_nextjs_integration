@@ -6,6 +6,8 @@ import {
   PRODUCT_VARIANTS_QUERY,
   ADMIN_PRODUCT_QUERY,
 } from "@/lib/shopify-admin"
+import { createProductOnOdoo } from "@/lib/odoo"
+import { createProductOnWooCommerce } from "@/lib/woocommerce"
 import type { AdminProductResponse } from "@/lib/types"
 
 export async function GET(request: Request) {
@@ -48,7 +50,7 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   try {
-    const { title, descriptionHtml, variants, imageUrl, imageAlt } =
+    const { title, descriptionHtml, variants, imageUrl, imageAlt, platform } =
       await request.json()
 
     if (!title) {
@@ -56,6 +58,28 @@ export async function POST(request: Request) {
         { error: "Title is required" },
         { status: 400 }
       )
+    }
+
+    if (platform === "odoo") {
+      const product = await createProductOnOdoo({
+        title,
+        descriptionHtml,
+        price: variants?.[0]?.price,
+        imageUrl,
+        imageAlt,
+      })
+      return NextResponse.json({ product }, { status: 201 })
+    }
+
+    if (platform === "woocommerce") {
+      const product = await createProductOnWooCommerce({
+        title,
+        descriptionHtml,
+        price: variants?.[0]?.price,
+        imageUrl,
+        imageAlt,
+      })
+      return NextResponse.json({ product }, { status: 201 })
     }
 
     const input: Record<string, unknown> = {
