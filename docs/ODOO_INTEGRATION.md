@@ -1,6 +1,6 @@
 # Odoo + Next.js Integration Guide
 
-This guide covers integrating Odoo's XML-RPC API into a Next.js 14 App Router project for product creation alongside the existing Shopify integration.
+This guide covers integrating Odoo's XML-RPC API into a Next.js 14 App Router project for product creation and order fetching alongside the existing Shopify and WooCommerce integrations.
 
 ---
 
@@ -8,7 +8,7 @@ This guide covers integrating Odoo's XML-RPC API into a Next.js 14 App Router pr
 
 - **Node.js** 18+ and **npm**
 - An **Odoo instance** running (local or remote) with XML-RPC enabled (default on port 8069)
-- Odoo user credentials with create/write access to `product.template`
+- Odoo user credentials with create/write access to `product.template` and read access to `sale.order`
 
 ---
 
@@ -40,6 +40,8 @@ ODOO_PASSWORD=your-password
 | `ODOO_DB`        | Odoo database name                             |
 | `ODOO_USERNAME`  | User email for XML-RPC authentication          |
 | `ODOO_PASSWORD`  | User password for XML-RPC authentication       |
+
+> **Important:** The `ODOO_DB` must match the database that contains your orders. You can verify by logging into Odoo and checking which database is selected at login.
 
 ---
 
@@ -107,6 +109,44 @@ await methodCall(client, "execute_kw", [
 
 > Image upload failures are non-fatal — the product is created without an image and a warning is logged.
 
+### Fetching Orders
+
+Orders are fetched from the `sale.order` model via `search_read`, with order lines resolved from `sale.order.line`:
+
+```typescript
+const orders = await methodCall<OdooOrder[]>(client, "execute_kw", [
+  ODOO_DB, uid, ODOO_PASSWORD,
+  "sale.order", "search_read",
+  [[]],
+  {
+    fields: ["name", "state", "date_order", "amount_total", "amount_untaxed", "currency_id", "partner_id", "partner_shipping_id", "order_line"],
+    order: "date_order desc",
+    limit: 50,
+  },
+])
+
+// Resolve order lines
+const allLineIds = orders.flatMap((o) => o.order_line.flat())
+const lines = await methodCall<OdooOrderLine[]>(client, "execute_kw", [
+  ODOO_DB, uid, ODOO_PASSWORD,
+  "sale.order.line", "read",
+  [allLineIds],
+  { fields: ["name", "product_uom_qty", "price_unit", "price_subtotal"] },
+])
+```
+
+#### Odoo Order State Mapping
+
+| Odoo `state` | Displayed Status |
+|--------------|------------------|
+| `draft`      | DRAFT            |
+| `sent`       | SENT             |
+| `sale`       | SALE             |
+| `done`       | DONE             |
+| `cancel`     | CANCELLED        |
+
+Fulfillment status is derived: `done` → DELIVERED, `sale` → CONFIRMED, otherwise null.
+
 ---
 
 ## 5. API Route Integration (`src/app/api/products/route.ts`)
@@ -172,13 +212,15 @@ The Add Product page (`src/app/products/add/page.tsx`) now includes a **Platform
 
 ## 7. Mapped Odoo Fields
 
-| Form Field            | Odoo `product.template` Field | Notes                        |
-|-----------------------|-------------------------------|------------------------------|
-| Title                 | `name`                        | Required                     |
-| Description (HTML)    | `description`                 | Sales description            |
-| Description (HTML)    | `description_sale`            | Short description (duplicated)|
-| Price                 | `list_price`                  | Parsed as Number              |
-| Image URL             | `image_1920`                  | Downloaded & base64-encoded   |
+### Product Fields (`product.template`)
+
+| Form Field            | Odoo Field           | Notes                         |
+|-----------------------|----------------------|-------------------------------|
+| Title                 | `name`               | Required                      |
+| Description (HTML)    | `description`        | Sales description             |
+| Description (HTML)    | `description_sale`   | Short description (duplicated)|
+| Price                 | `list_price`         | Parsed as Number              |
+| Image URL             | `image_1920`         | Downloaded & base64-encoded   |
 
 Additional hardcoded values:
 
@@ -188,39 +230,83 @@ Additional hardcoded values:
 | `sale_ok`       | `true` | Can be sold               |
 | `purchase_ok`   | `true` | Can be purchased          |
 
+### Order Fields (`sale.order`)
+
+| Odoo Field            | UnifiedOrder Field   | Notes                          |
+|-----------------------|----------------------|--------------------------------|
+| `name`                | `name`               | Order reference (e.g. S00001)  |
+| `state`               | `status`             | Mapped via state table above   |
+| `date_order`          | `createdAt`          | Order date                     |
+| `amount_total`        | `total.amount`       | Total including tax            |
+| `currency_id`         | `total.currencyCode` | Many2one: [id, name]           |
+| `order_line`          | `lineItems`          | One2many: resolved via `sale.order.line` |
+
+### Order Line Fields (`sale.order.line`)
+
+| Odoo Field         | UnifiedOrder lineItem Field | Notes              |
+|--------------------|-----------------------------|--------------------|
+| `name`             | `name`                      | Product name       |
+| `product_uom_qty`  | `quantity`                  | Quantity ordered   |
+| `price_subtotal`   | `total`                     | Subtotal per line  |
+
 ---
 
-## 8. Error Handling
+## 8. Orders Page
+
+The orders page (`/orders`) fetches from all three platforms simultaneously:
+
+- **Shopify** — via Admin API GraphQL `orders` query
+- **WooCommerce** — via REST API `GET /wp-json/wc/v3/orders`
+- **Odoo** — via XML-RPC `search_read` on `sale.order` + `sale.order.line`
+
+All orders are normalized into the `UnifiedOrder` type and sorted by date (newest first). Platform filter tabs are available: All / Shopify / WooCommerce / Odoo.
+
+Each platform's fetch is independent — a failure on one does not affect the others, and an error card is shown for the failing platform.
+
+---
+
+## 9. Error Handling
 
 - **Authentication failure**: Throws `"Odoo authentication failed – invalid credentials"` when UID is `0` or `null`
 - **XML-RPC errors**: Wrapped as `"Odoo XML-RPC error: {message}"`
 - **Image upload failure**: Warns via `console.warn` but does not fail the product creation
+- **Order fetch failure**: Caught per-platform on the orders page; shown as an orange error card
 
 All errors are returned to the frontend as `{ error: "message" }` with the appropriate HTTP status code.
 
 ---
 
-## 9. Known Limitations
+## 10. Known Limitations
 
-### 9.1. Product listing only shows Shopify products
+### 10.1. Product listing only shows Shopify products
 
 The homepage (`/`) fetches products from Shopify's Admin API. Odoo-created products do not appear in the grid. To view them, log into the Odoo backend directly.
 
-### 9.2. No unified product ID
+### 10.2. No unified product ID
 
-Shopify and Odoo use entirely different ID schemes (`gid://shopify/Product/...` vs integer IDs). There is no cross-reference table linking products across platforms.
+Shopify, WooCommerce, and Odoo use entirely different ID schemes. There is no cross-reference table linking products across platforms.
 
-### 9.3. Image upload requires outbound internet
+### 10.3. Image upload requires outbound internet
 
 The Odoo client downloads image URLs server-side via `fetch`. If the Odoo instance is on a private network, the image source URL must be reachable from the Next.js server.
 
-### 9.4. Session UID is cached in memory
+### 10.4. Session UID is cached in memory
 
 The authenticated UID is cached as a module-level variable. In serverless environments (Vercel, etc.), this cache may be per-instance and not persist across cold starts.
 
+### 10.5. Order access requires Sales user/group
+
+The XML-RPC user must have **Sales / Administrator** or **Sales / User** access rights in Odoo to read `sale.order` records. Without this, `search_read` returns 0 records even though orders exist.
+
+**To fix:** Go to Odoo Settings → Users → [user] → Access Rights → Sales → set to "User" or "Administrator".
+
+### 10.6. Database name must match
+
+The `ODOO_DB` environment variable must match the exact database name where your orders are stored. If `search_count` returns 0 despite orders being visible in the Odoo UI, the database name is likely wrong.
+
 ---
 
-## 10. Testing the Integration
+## 11. Testing the Integration
 
 ### With a local Odoo instance
 
@@ -234,7 +320,7 @@ npm run dev
 
 Then visit `http://localhost:3000/products/add`, select **Odoo** as the platform, fill in the form, and submit.
 
-### Verify in Odoo
+### Verify products in Odoo
 
 ```bash
 # Check the product was created
@@ -259,9 +345,13 @@ curl http://localhost:8069/xmlrpc/2/object \
   </methodCall>'
 ```
 
+### Verify orders in the app
+
+Visit `http://localhost:3000/orders` and select the **Odoo** tab to see Odoo orders alongside Shopify and WooCommerce orders.
+
 ---
 
-## 11. Odoo XML-RPC API Reference
+## 12. Odoo XML-RPC API Reference
 
 | Endpoint               | Common Methods                          |
 |------------------------|------------------------------------------|
@@ -278,17 +368,20 @@ curl http://localhost:8069/xmlrpc/2/object \
 6. **args** (array) — positional arguments
 7. **kwargs** (object, optional) — keyword arguments
 
-### Common `product.template` methods
+### Common models and methods
 
-| Method         | Args                              | Returns       |
-|----------------|-----------------------------------|---------------|
-| `create`       | `[fields_object]`                 | New record ID |
-| `write`        | `[[ids], fields_object]`          | `true`        |
-| `search_read`  | `[domain, [fields]]`              | Array of records |
+| Model                | Method         | Args                                  | Returns          |
+|----------------------|----------------|---------------------------------------|------------------|
+| `product.template`   | `create`       | `[fields_object]`                     | New record ID    |
+| `product.template`   | `write`        | `[[ids], fields_object]`              | `true`           |
+| `product.template`   | `search_read`  | `[domain], {fields, limit}`           | Array of records |
+| `sale.order`         | `search_read`  | `[domain], {fields, order, limit}`    | Array of records |
+| `sale.order.line`    | `read`         | `[ids], {fields}`                     | Array of records |
+| `sale.order`         | `search_count` | `[domain]`                            | Integer          |
 
 ---
 
-## 12. Quick Reference
+## 13. Quick Reference
 
 - [Odoo External API documentation](https://www.odoo.com/documentation/master/developer/reference/external_api.html)
 - Odoo XML-RPC endpoints:
@@ -296,3 +389,5 @@ curl http://localhost:8069/xmlrpc/2/object \
   - Object: `{ODOO_URL}/xmlrpc/2/object`
 - Default Odoo port: **8069**
 - Model for products: `product.template`
+- Model for orders: `sale.order`
+- Model for order lines: `sale.order.line`

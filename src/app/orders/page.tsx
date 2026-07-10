@@ -1,13 +1,12 @@
 export const dynamic = "force-dynamic"
 
-import { shopifyAdminFetch, ADMIN_PRODUCTS_QUERY, ADMIN_ORDERS_QUERY } from "@/lib/shopify-admin"
+import { shopifyAdminFetch, ADMIN_ORDERS_QUERY } from "@/lib/shopify-admin"
 import { fetchWooCommerceOrders } from "@/lib/woocommerce"
 import { fetchOdooOrders } from "@/lib/odoo"
-import type { AdminProductsResponse, AdminOrdersResponse, ShopifyOrder, WooCommerceOrder, OdooOrder, OdooOrderLine, UnifiedOrder } from "@/lib/types"
-import ProductCard from "@/components/ProductCard"
+import type { AdminOrdersResponse, ShopifyOrder, WooCommerceOrder, OdooOrder, OdooOrderLine, UnifiedOrder } from "@/lib/types"
+import Link from "next/link"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
-import Link from "next/link"
 
 function formatCurrency(amount: string, currency: string) {
   return new Intl.NumberFormat("en-US", {
@@ -136,87 +135,161 @@ function OrderCard({ order }: { order: UnifiedOrder }) {
             </div>
           </div>
         </div>
+
         {order.shippingAddress && (
-          <p className="text-xs text-muted-foreground">{order.shippingAddress}</p>
+          <p className="mb-2 text-xs text-muted-foreground">{order.shippingAddress}</p>
+        )}
+
+        {order.lineItems.length > 0 && (
+          <details className="mt-2">
+            <summary className="cursor-pointer text-xs text-muted-foreground hover:text-foreground">
+              Items ({order.lineItems.length})
+            </summary>
+            <ul className="mt-1 space-y-1">
+              {order.lineItems.map((item) => (
+                <li key={item.id} className="flex justify-between text-xs">
+                  <span>{item.name} x{item.quantity}</span>
+                  <span className="text-muted-foreground">{formatCurrency(item.total, order.total.currencyCode)}</span>
+                </li>
+              ))}
+            </ul>
+          </details>
         )}
       </CardContent>
     </Card>
   )
 }
 
-export default async function Home() {
-  const [{ products }, { orders }] = await Promise.all([
-    shopifyAdminFetch<AdminProductsResponse>({ query: ADMIN_PRODUCTS_QUERY }),
-    shopifyAdminFetch<AdminOrdersResponse>({
+const tabs = [
+  { label: "All", value: "all" },
+  { label: "Shopify", value: "shopify" },
+  { label: "WooCommerce", value: "woocommerce" },
+  { label: "Odoo", value: "odoo" },
+] as const
+
+export default async function OrdersPage({
+  searchParams,
+}: {
+  searchParams: { platform?: string }
+}) {
+  let shopifyOrders: UnifiedOrder[] = []
+  let wooOrders: UnifiedOrder[] = []
+  let odooOrders: UnifiedOrder[] = []
+  let shopifyError: string | null = null
+  let wooError: string | null = null
+  let odooError: string | null = null
+
+  try {
+    const data = await shopifyAdminFetch<AdminOrdersResponse>({
       query: ADMIN_ORDERS_QUERY,
-      variables: { first: 6 },
-    }),
-  ])
-
-  let wooOrders: WooCommerceOrder[] = []
-  try {
-    wooOrders = await fetchWooCommerceOrders(6)
-  } catch {
-    // WooCommerce orders are optional on the home page
+      variables: { first: 50 },
+    })
+    shopifyOrders = data.orders.nodes.map((o) => toUnifiedOrder(o, "shopify"))
+  } catch (error) {
+    shopifyError = error instanceof Error ? error.message : "Something went wrong"
   }
 
-  let odooOrders: Awaited<ReturnType<typeof fetchOdooOrders>> = []
   try {
-    odooOrders = await fetchOdooOrders(6)
-  } catch {
-    // Odoo orders are optional on the home page
+    const orders = await fetchWooCommerceOrders(50)
+    wooOrders = orders.map((o) => toUnifiedOrder(o, "woocommerce"))
+  } catch (error) {
+    wooError = error instanceof Error ? error.message : "Something went wrong"
   }
 
-  const shopifyOrders = orders.nodes.map((o) => toUnifiedOrder(o, "shopify"))
-  const wooUnified = wooOrders.map((o) => toUnifiedOrder(o, "woocommerce"))
-  const odooUnified = odooOrders.map((o) => toUnifiedOrder(o, "odoo"))
-  const allOrders = [...shopifyOrders, ...wooUnified, ...odooUnified].sort(
+  try {
+    const orders = await fetchOdooOrders(50)
+    odooOrders = orders.map((o) => toUnifiedOrder(o, "odoo"))
+  } catch (error) {
+    odooError = error instanceof Error ? error.message : "Something went wrong"
+  }
+
+  const allOrders = [...shopifyOrders, ...wooOrders, ...odooOrders].sort(
     (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
   )
 
+  const activeTab = tabs.find((t) => t.value === searchParams.platform)?.value ?? "all"
+
+  const filteredOrders =
+    activeTab === "all" ? allOrders : allOrders.filter((o) => o.platform === activeTab)
+
   return (
-    <main className="mx-auto max-w-7xl px-4 py-8">
+    <main className="mx-auto max-w-4xl px-4 py-8">
       <div className="mb-8 flex items-center justify-between">
-        <h1 className="text-3xl font-bold tracking-tight">Products</h1>
-        <div className="flex gap-2">
-          <Link href="/products/add">
-            <Button>+ Add Product</Button>
-          </Link>
-          <Link href="/products/bulk">
-            <Button variant="outline">Bulk Upload</Button>
-          </Link>
-          <Link href="/orders">
-            <Button variant="outline">Orders</Button>
-          </Link>
-        </div>
-      </div>
-      <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-        {products.nodes.map((product) => (
-          <ProductCard key={product.id} product={product} />
-        ))}
+        <h1 className="text-3xl font-bold tracking-tight">Orders</h1>
+        <Link href="/">
+          <Button variant="outline">&larr; Products</Button>
+        </Link>
       </div>
 
-      <div className="mt-12">
-        <div className="mb-6 flex items-center justify-between">
-          <h2 className="text-2xl font-bold tracking-tight">Recent Orders</h2>
-          <Link href="/orders">
-            <Button variant="outline" size="sm">View All</Button>
-          </Link>
-        </div>
-        {allOrders.length > 0 ? (
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-            {allOrders.map((order) => (
-              <OrderCard key={`${order.platform}-${order.id}`} order={order} />
-            ))}
-          </div>
-        ) : (
-          <Card>
-            <CardContent className="py-12 text-center text-muted-foreground">
-              No orders yet
-            </CardContent>
-          </Card>
-        )}
+      {shopifyError && (
+        <Card className="mb-4 border-yellow-200 bg-yellow-50">
+          <CardContent className="p-4">
+            <p className="text-sm font-medium text-yellow-800">
+              Could not load orders from Shopify.
+            </p>
+            <p className="mt-1 text-xs text-yellow-700">
+              {shopifyError.includes("ACCESS_DENIED")
+                ? "The Shopify access token needs the read_orders scope."
+                : shopifyError}
+            </p>
+          </CardContent>
+        </Card>
+      )}
+
+      {wooError && (
+        <Card className="mb-4 border-red-200 bg-red-50">
+          <CardContent className="p-4">
+            <p className="text-sm font-medium text-red-800">
+              Could not load orders from WooCommerce.
+            </p>
+            <p className="mt-1 text-xs text-red-700">{wooError}</p>
+          </CardContent>
+        </Card>
+      )}
+
+      {odooError && (
+        <Card className="mb-4 border-orange-200 bg-orange-50">
+          <CardContent className="p-4">
+            <p className="text-sm font-medium text-orange-800">
+              Could not load orders from Odoo.
+            </p>
+            <p className="mt-1 text-xs text-orange-700">{odooError}</p>
+          </CardContent>
+        </Card>
+      )}
+
+      <div className="mb-6 flex gap-1 rounded-lg border bg-muted p-1">
+        {tabs.map((tab) => {
+          const href = tab.value === "all" ? "/orders" : `/orders?platform=${tab.value}`
+          return (
+            <Link
+              key={tab.value}
+              href={href}
+              className={`inline-flex items-center justify-center whitespace-nowrap rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+                activeTab === tab.value
+                  ? "bg-background text-foreground shadow-sm"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              {tab.label}
+            </Link>
+          )
+        })}
       </div>
+
+      {filteredOrders.length === 0 ? (
+        <Card>
+          <CardContent className="py-12 text-center text-muted-foreground">
+            No orders yet
+          </CardContent>
+        </Card>
+      ) : (
+        <div className="space-y-4">
+          {filteredOrders.map((order) => (
+            <OrderCard key={`${order.platform}-${order.id}`} order={order} />
+          ))}
+        </div>
+      )}
     </main>
   )
 }

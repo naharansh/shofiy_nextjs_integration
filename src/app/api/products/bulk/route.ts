@@ -4,57 +4,31 @@ import {
   CREATE_PRODUCT_MUTATION,
   UPDATE_VARIANT_MUTATION,
   PRODUCT_VARIANTS_QUERY,
-  ADMIN_PRODUCT_QUERY,
 } from "@/lib/shopify-admin"
 import { createProductOnOdoo } from "@/lib/odoo"
 import { createProductOnWooCommerce } from "@/lib/woocommerce"
-import type { AdminProductResponse } from "@/lib/types"
 
-export async function GET(request: Request) {
-  const { searchParams } = new URL(request.url)
-  const handle = searchParams.get("handle")
-
-  if (!handle) {
-    return NextResponse.json(
-      { error: "handle query param required" },
-      { status: 400 }
-    )
-  }
-
-  try {
-    const { productByHandle } =
-      await shopifyAdminFetch<AdminProductResponse>({
-        query: ADMIN_PRODUCT_QUERY,
-        variables: { handle },
-      })
-
-    if (!productByHandle) {
-      return NextResponse.json({ error: "Not found" }, { status: 404 })
-    }
-
-    const numericId = productByHandle.id.split("/").pop()
-    const price = productByHandle.variants.nodes[0]?.price
-
-    return NextResponse.json({
-      numericId,
-      title: productByHandle.title,
-      descriptionHtml: productByHandle.descriptionHtml,
-      price,
-    })
-  } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "Something went wrong"
-    return NextResponse.json({ error: message }, { status: 500 })
-  }
-}
-
-async function createShopifyProduct(data: {
+type BulkProduct = {
   title: string
   descriptionHtml?: string
   price?: string
   imageUrl?: string
   imageAlt?: string
-}) {
+}
+
+type PlatformResult = {
+  success: boolean
+  product?: Record<string, unknown>
+  error?: string
+}
+
+type BulkResult = {
+  index: number
+  title: string
+  results: Record<string, PlatformResult>
+}
+
+async function createShopifyProduct(data: BulkProduct) {
   const input: Record<string, unknown> = {
     title: data.title,
     descriptionHtml: data.descriptionHtml || "",
@@ -98,7 +72,7 @@ async function createShopifyProduct(data: {
 
     if (!imgRes.ok) {
       const errBody = await imgRes.text()
-      console.warn(`Image upload failed: ${errBody.slice(0, 200)}`)
+      console.warn(`Image upload failed for ${data.title}: ${errBody.slice(0, 200)}`)
     }
   }
 
@@ -132,7 +106,7 @@ async function createShopifyProduct(data: {
 
       if (productVariantsBulkUpdate.userErrors.length > 0) {
         console.warn(
-          `Price update failed: ${productVariantsBulkUpdate.userErrors.map((e) => e.message).join(", ")}`
+          `Price update failed for ${data.title}: ${productVariantsBulkUpdate.userErrors.map((e) => e.message).join(", ")}`
         )
       }
     }
@@ -141,45 +115,74 @@ async function createShopifyProduct(data: {
   return { id: product.id, title: product.title, handle: product.handle }
 }
 
+async function createOnAllPlatforms(data: BulkProduct) {
+  const platformFns = [
+    { name: "shopify", fn: () => createShopifyProduct(data) },
+    { name: "woocommerce", fn: () => createProductOnWooCommerce(data) },
+    { name: "odoo", fn: () => createProductOnOdoo(data) },
+  ]
+
+  const results: Record<string, PlatformResult> = {}
+
+  for (const { name, fn } of platformFns) {
+    try {
+      const product = await fn()
+      results[name] = { success: true, product }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Something went wrong"
+      results[name] = { success: false, error: message }
+    }
+  }
+
+  return results
+}
+
 export async function POST(request: Request) {
   try {
-    const { title, descriptionHtml, variants, imageUrl, imageAlt } =
-      await request.json()
+    const { products } = await request.json()
 
-    if (!title) {
+    if (!Array.isArray(products) || products.length === 0) {
       return NextResponse.json(
-        { error: "Title is required" },
+        { error: "products must be a non-empty array" },
         { status: 400 }
       )
     }
 
-    const data = {
-      title,
-      descriptionHtml,
-      price: variants?.[0]?.price,
-      imageUrl,
-      imageAlt,
+    if (products.length > 100) {
+      return NextResponse.json(
+        { error: "Maximum 100 products per bulk upload" },
+        { status: 400 }
+      )
     }
 
-    const results: Record<string, { success: boolean; product?: Record<string, unknown>; error?: string }> = {}
-
-    const platforms = [
-      { name: "shopify", fn: () => createShopifyProduct(data) },
-      { name: "woocommerce", fn: () => createProductOnWooCommerce(data) },
-      { name: "odoo", fn: () => createProductOnOdoo(data) },
-    ]
-
-    for (const { name, fn } of platforms) {
-      try {
-        const product = await fn()
-        results[name] = { success: true, product }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "Something went wrong"
-        results[name] = { success: false, error: message }
+    for (let i = 0; i < products.length; i++) {
+      if (!products[i].title) {
+        return NextResponse.json(
+          { error: `Product at index ${i} is missing title` },
+          { status: 400 }
+        )
       }
     }
 
-    return NextResponse.json({ results }, { status: 201 })
+    const results: BulkResult[] = []
+
+    for (let i = 0; i < products.length; i++) {
+      const data = products[i] as BulkProduct
+      const perPlatform = await createOnAllPlatforms(data)
+      results.push({ index: i, title: data.title, results: perPlatform })
+    }
+
+    const total = products.length * 3
+    const succeeded = results.reduce(
+      (acc, r) => acc + Object.values(r.results).filter((v) => v.success).length,
+      0
+    )
+    const failed = total - succeeded
+
+    return NextResponse.json({
+      results,
+      summary: { total, succeeded, failed },
+    })
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "Something went wrong"

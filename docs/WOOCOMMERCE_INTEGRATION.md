@@ -173,27 +173,78 @@ All errors are returned to the frontend as `{ error: "message" }` with the appro
 
 ---
 
-## 8. Known Limitations
+## 8. Orders (WooCommerce)
 
-### 8.1. Product listing only shows Shopify products
+The project can fetch and display WooCommerce orders alongside Shopify orders.
 
-The homepage (`/`) fetches products from Shopify's Admin API. WooCommerce-created products do not appear in the grid. View them in WordPress admin at **WooCommerce → Products**.
+### Fetching Orders
 
-### 8.2. Simple products only
+```typescript
+import { fetchWooCommerceOrders } from "@/lib/woocommerce"
+
+const orders = await fetchWooCommerceOrders(50)
+```
+
+The function calls `GET /wp-json/wc/v3/orders?per_page={limit}&orderby=date&order=desc` and returns an array of `WooCommerceOrder` objects.
+
+### Order Type
+
+```typescript
+type WooCommerceOrder = {
+  id: number
+  number: string
+  status: string
+  date_created: string
+  total: string
+  currency: string
+  billing: { first_name: string; last_name: string; address_1: string | null; city: string; state: string; postcode: string; country: string }
+  shipping: { first_name: string; last_name: string; address_1: string | null; city: string; state: string; postcode: string; country: string }
+  line_items: Array<{ id: number; name: string; quantity: number; total: string; price: number }>
+}
+```
+
+### Order Status Mapping
+
+| WooCommerce Status | Unified Status     |
+|--------------------|--------------------|
+| `processing`       | `PENDING`          |
+| `completed`        | `PAID` / `FULFILLED` |
+| `on-hold`          | `ON-HOLD`          |
+| `cancelled`        | `CANCELLED`        |
+
+### Orders Page (`/orders`)
+
+The orders page fetches from both Shopify and WooCommerce, converts each to a `UnifiedOrder`, sorts by date descending, and displays them with a platform badge. Three tabs allow filtering:
+
+- **All** — shows orders from both platforms
+- **Shopify** — only Shopify orders
+- **WooCommerce** — only WooCommerce orders
+
+Filtering uses URL search params (`?platform=shopify` or `?platform=woocommerce`).
+
+### Homepage Integration
+
+The homepage (`/`) shows the 6 most recent orders from each platform (sorted together by date). WooCommerce fetch errors on the homepage are silently caught so they don't block the product grid.
+
+---
+
+## 9. Known Limitations
+
+### 9.1. Simple products only
 
 This integration creates `type: "simple"` products. Variable products, grouped products, or external products are not supported.
 
-### 8.3. No category or tag mapping
+### 9.2. No category or tag mapping
 
 Categories and tags are not set during creation. You can extend `createProductOnWooCommerce` to accept category IDs or tag IDs if needed.
 
-### 8.4. Image URL must be publicly accessible
+### 9.3. Image URL must be publicly accessible
 
 WooCommerce fetches the image from the provided `src` URL server-side. The URL must be reachable from the WordPress installation.
 
 ---
 
-## 9. Testing the Integration
+## 10. Testing the Integration
 
 ### With a local WordPress/WooCommerce site
 
@@ -219,7 +270,7 @@ curl -X POST {WOOCOMMERCE_URL}/wp-json/wc/v3/products \
 
 ---
 
-## 10. WooCommerce REST API Reference
+## 11. WooCommerce REST API Reference
 
 | Method   | Endpoint                              | Description          |
 |----------|---------------------------------------|----------------------|
@@ -228,6 +279,8 @@ curl -X POST {WOOCOMMERCE_URL}/wp-json/wc/v3/products \
 | `GET`    | `/wp-json/wc/v3/products/{id}`        | Get single product   |
 | `PUT`    | `/wp-json/wc/v3/products/{id}`        | Update product       |
 | `DELETE` | `/wp-json/wc/v3/products/{id}`        | Delete product       |
+| `GET`    | `/wp-json/wc/v3/orders`               | List orders          |
+| `GET`    | `/wp-json/wc/v3/orders/{id}`          | Get single order     |
 
 ### Product fields commonly used
 
@@ -246,7 +299,7 @@ curl -X POST {WOOCOMMERCE_URL}/wp-json/wc/v3/products \
 
 ---
 
-## 11. Quick Reference
+## 12. Quick Reference
 
 - [WooCommerce REST API documentation](https://woocommerce.github.io/woocommerce-rest-api-docs/)
 - WooCommerce REST API endpoint: `{WOOCOMMERCE_URL}/wp-json/wc/v3/`

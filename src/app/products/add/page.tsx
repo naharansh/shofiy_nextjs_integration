@@ -9,13 +9,11 @@ import { Textarea } from "@/components/ui/textarea"
 import { Label } from "@/components/ui/label"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 
-const platforms = [
-  { value: "shopify", label: "Shopify" },
-  { value: "woocommerce", label: "WooCommerce" },
-  { value: "odoo", label: "Odoo" },
-] as const
-
-type Platform = (typeof platforms)[number]["value"]
+type PlatformResult = {
+  success: boolean
+  product?: Record<string, unknown>
+  error?: string
+}
 
 export default function AddProductPage() {
   const router = useRouter()
@@ -23,14 +21,15 @@ export default function AddProductPage() {
   const [description, setDescription] = useState("")
   const [price, setPrice] = useState("")
   const [imageUrl, setImageUrl] = useState("")
-  const [platform, setPlatform] = useState<Platform>("shopify")
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState("")
+  const [results, setResults] = useState<Record<string, PlatformResult> | null>(null)
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault()
     setSubmitting(true)
     setError("")
+    setResults(null)
 
     try {
       const res = await fetch("/api/products", {
@@ -42,7 +41,6 @@ export default function AddProductPage() {
           variants: [{ price: price || undefined }],
           imageUrl: imageUrl || undefined,
           imageAlt: title,
-          platform,
         }),
       })
 
@@ -53,13 +51,15 @@ export default function AddProductPage() {
         return
       }
 
-      router.push("/")
+      setResults(data.results)
     } catch {
       setError("Something went wrong")
     } finally {
       setSubmitting(false)
     }
   }
+
+  const allSucceeded = results && Object.values(results).every((r) => r.success)
 
   return (
     <main className="mx-auto max-w-lg px-4 py-8">
@@ -70,32 +70,12 @@ export default function AddProductPage() {
         &larr; Back to products
       </Link>
 
-      <Card>
+      <Card className="mb-8">
         <CardHeader>
           <CardTitle>Add Product</CardTitle>
         </CardHeader>
         <CardContent>
           <form onSubmit={handleSubmit} className="space-y-4">
-            <div className="space-y-2">
-              <Label>Platform</Label>
-              <div className="flex gap-2">
-                {platforms.map((p) => (
-                  <button
-                    key={p.value}
-                    type="button"
-                    onClick={() => setPlatform(p.value)}
-                    className={`flex-1 rounded-lg border-2 px-4 py-2 text-sm font-medium transition-colors ${
-                      platform === p.value
-                        ? "border-primary bg-primary/10 text-primary"
-                        : "border-input bg-background text-muted-foreground hover:border-muted-foreground"
-                    }`}
-                  >
-                    {p.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-
             <div className="space-y-2">
               <Label htmlFor="title">Title *</Label>
               <Input
@@ -146,14 +126,53 @@ export default function AddProductPage() {
               <p className="text-sm font-medium text-destructive">{error}</p>
             )}
 
+            {allSucceeded && (
+              <p className="text-sm font-medium text-green-600">
+                Created successfully on all platforms!
+              </p>
+            )}
+
             <Button type="submit" disabled={submitting} className="w-full">
-              {submitting
-                ? "Creating..."
-                : `Create on ${platforms.find((p) => p.value === platform)?.label}`}
+              {submitting ? "Creating..." : "Create Product"}
             </Button>
           </form>
         </CardContent>
       </Card>
+
+      {results && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Results</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-2">
+              {Object.entries(results).map(([platform, r]) => (
+                <div
+                  key={platform}
+                  className={`rounded-md border px-4 py-3 text-sm ${
+                    r.success
+                      ? "border-green-200 bg-green-50 text-green-800"
+                      : "border-red-200 bg-red-50 text-red-800"
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="font-medium capitalize">{platform}</span>
+                    <span>{r.success ? "Created" : "Failed"}</span>
+                  </div>
+                  {r.success && r.product && (
+                    <p className="mt-1 text-xs opacity-75">
+                      {JSON.stringify(r.product)}
+                    </p>
+                  )}
+                  {r.error && (
+                    <p className="mt-1 text-xs opacity-75">{r.error}</p>
+                  )}
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      )}
     </main>
   )
 }

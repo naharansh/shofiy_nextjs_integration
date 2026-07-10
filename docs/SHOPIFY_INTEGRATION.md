@@ -46,7 +46,7 @@ SHOPIFY_ADMIN_ACCESS_TOKEN=your-admin-token
 | Storefront API token     | **Settings → Sales channels → Shopfront → API → Storefront API access tokens**            |
 | Admin API token          | **Apps → Develop apps → Create an app → Admin API → Configure scopes → Issue token**      |
 
-> **Admin API scopes needed**: `read_products`, `write_products`, `read_product_listings`, `write_product_listings`
+> **Admin API scopes needed**: `read_products`, `write_products`, `read_product_listings`, `write_product_listings`, `read_orders`
 
 ---
 
@@ -214,6 +214,26 @@ export const DELETE_PRODUCT_MUTATION = `#graphql
     }
   }
 `
+
+// List recent orders
+export const ADMIN_ORDERS_QUERY = `#graphql
+  query AdminOrders($first: Int!, $after: String) {
+    orders(first: $first, after: $after, sortKey: CREATED_AT, reverse: true) {
+      nodes {
+        id, name, createdAt, processedAt
+        displayFinancialStatus, displayFulfillmentStatus
+        totalPriceSet { shopMoney { amount, currencyCode } }
+        subtotalPriceSet { shopMoney { amount, currencyCode } }
+        totalTaxSet { shopMoney { amount, currencyCode } }
+        shippingAddress { address1, address2, city, province, zip, country }
+        lineItems(first: 20) {
+          nodes { id, name, quantity, originalUnitPriceSet { shopMoney { amount, currencyCode } }, product { id } }
+        }
+      }
+      pageInfo { hasNextPage, endCursor }
+    }
+  }
+`
 ```
 
 ---
@@ -360,6 +380,40 @@ export type AdminProduct = {
 
 export type AdminProductsResponse = { products: { nodes: AdminProduct[] } }
 export type AdminProductResponse = { productByHandle: AdminProduct | null }
+
+export type ShopifyOrder = {
+  id: string
+  name: string
+  createdAt: string
+  processedAt: string | null
+  displayFinancialStatus: string | null
+  displayFulfillmentStatus: string | null
+  totalPriceSet: { shopMoney: { amount: string; currencyCode: string } }
+  subtotalPriceSet: { shopMoney: { amount: string; currencyCode: string } }
+  totalTaxSet: { shopMoney: { amount: string; currencyCode: string } }
+  shippingAddress: { address1: string | null; address2: string | null; city: string | null; province: string | null; zip: string | null; country: string | null } | null
+  lineItems: {
+    nodes: Array<{
+      id: string; name: string; quantity: number
+      originalUnitPriceSet: { shopMoney: { amount: string; currencyCode: string } }
+      product: { id: string } | null
+    }>
+  }
+}
+
+export type AdminOrdersResponse = { orders: { nodes: ShopifyOrder[] } }
+
+export type UnifiedOrder = {
+  id: string
+  name: string
+  createdAt: string
+  total: { amount: string; currencyCode: string }
+  status: string
+  fulfillmentStatus: string | null
+  shippingAddress: string | null
+  lineItems: Array<{ id: string; name: string; quantity: number; total: string }>
+  platform: "shopify" | "woocommerce"
+}
 ```
 
 ---
@@ -370,31 +424,72 @@ All pages use `force-dynamic` to avoid serving stale data.
 
 | Page                                         | Type              | Description                        |
 |-----------------------------------------------|-------------------|------------------------------------|
-| `/`                                           | Server Component  | Product grid with Cards             |
+| `/`                                           | Server Component  | Product grid + recent orders        |
+| `/orders`                                     | Server Component  | Orders list (Shopify + WooCommerce) |
 | `/products/[handle]`                          | Server Component  | Product detail, Edit/Delete buttons |
 | `/products/add`                               | Client Component  | Form to create a product            |
 | `/products/[handle]/edit`                     | Client Component  | Pre-filled edit form                |
+| `/products/bulk`                              | Client Component  | Bulk product upload                 |
 
 ### Homepage (`src/app/page.tsx`)
+
+The homepage fetches products from Shopify and recent orders from both Shopify and WooCommerce, displaying them in two sections.
 
 ```tsx
 export const dynamic = "force-dynamic"
 
 export default async function Home() {
-  const { products } = await shopifyAdminFetch<AdminProductsResponse>({ query: ADMIN_PRODUCTS_QUERY })
+  const [{ products }, { orders }] = await Promise.all([
+    shopifyAdminFetch<AdminProductsResponse>({ query: ADMIN_PRODUCTS_QUERY }),
+    shopifyAdminFetch<AdminOrdersResponse>({ query: ADMIN_ORDERS_QUERY, variables: { first: 6 } }),
+  ])
+
+  let wooOrders: WooCommerceOrder[] = []
+  try { wooOrders = await fetchWooCommerceOrders(6) } catch { /* optional */ }
+
+  const shopifyOrders = orders.nodes.map((o) => toUnifiedOrder(o, "shopify"))
+  const wooUnified = wooOrders.map((o) => toUnifiedOrder(o, "woocommerce"))
+  const allOrders = [...shopifyOrders, ...wooUnified].sort(
+    (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+  )
+
   return (
     <main className="mx-auto max-w-7xl px-4 py-8">
-      <div className="flex items-center justify-between mb-8">
+      <div className="mb-8 flex items-center justify-between">
         <h1 className="text-3xl font-bold">Products</h1>
-        <Link href="/products/add"><Button>+ Add Product</Button></Link>
+        <div className="flex gap-2">
+          <Link href="/products/add"><Button>+ Add Product</Button></Link>
+          <Link href="/products/bulk"><Button variant="outline">Bulk Upload</Button></Link>
+          <Link href="/orders"><Button variant="outline">Orders</Button></Link>
+        </div>
       </div>
       <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
         {products.nodes.map(product => <ProductCard key={product.id} product={product} />)}
+      </div>
+
+      <div className="mt-12">
+        <h2 className="text-2xl font-bold mb-6">Recent Orders</h2>
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {allOrders.map(order => <OrderCard key={`${order.platform}-${order.id}`} order={order} />)}
+        </div>
       </div>
     </main>
   )
 }
 ```
+
+### Orders Page (`/orders`)
+
+The orders page fetches up to 50 orders from both Shopify and WooCommerce, converts them to a unified format, merges and sorts by date descending, and displays them with platform badges. Tabs allow filtering by platform via URL search params (`?platform=shopify` or `?platform=woocommerce`).
+
+```tsx
+export default async function OrdersPage({ searchParams }: { searchParams: { platform?: string } }) {
+  // Fetch from both platforms, merge, sort, filter by searchParams.platform
+  // Render OrderCard with platform badge and expandable line items
+}
+```
+
+See `src/app/orders/page.tsx` for the full implementation.
 
 ### Product Card (`src/components/ProductCard.tsx`)
 

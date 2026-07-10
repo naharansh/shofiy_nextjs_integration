@@ -1,4 +1,5 @@
 import xmlrpc from "xmlrpc"
+import type { OdooOrder, OdooOrderLine } from "@/lib/types"
 
 const ODOO_URL = process.env.ODOO_URL!
 const ODOO_DB = process.env.ODOO_DB!
@@ -112,4 +113,40 @@ export async function createProductOnOdoo(data: {
   }
 
   return { id: productId, title: data.title }
+}
+
+export async function fetchOdooOrders(limit = 50) {
+  const uid = await authenticate()
+  const client = getObjectClient()
+
+  const orders = await methodCall<OdooOrder[]>(client, "execute_kw", [
+    ODOO_DB, uid, ODOO_PASSWORD,
+    "sale.order", "search_read",
+    [[]],
+    {
+      fields: ["name", "state", "date_order", "amount_total", "amount_untaxed", "currency_id", "partner_id", "partner_shipping_id", "order_line"],
+      order: "date_order desc",
+      limit,
+    },
+  ])
+
+  if (orders.length === 0) return []
+
+  const allLineIds = orders.flatMap((o) => o.order_line.flat())
+  let lineMap: Record<number, OdooOrderLine> = {}
+
+  if (allLineIds.length > 0) {
+    const lines = await methodCall<OdooOrderLine[]>(client, "execute_kw", [
+      ODOO_DB, uid, ODOO_PASSWORD,
+      "sale.order.line", "read",
+      [allLineIds],
+      { fields: ["name", "product_uom_qty", "price_unit", "price_subtotal"] },
+    ])
+    lineMap = Object.fromEntries(lines.map((l) => [l.id, l]))
+  }
+
+  return orders.map((order) => ({
+    ...order,
+    resolvedLines: order.order_line.flat().map((lineId: number) => lineMap[lineId]).filter(Boolean) as OdooOrderLine[],
+  }))
 }

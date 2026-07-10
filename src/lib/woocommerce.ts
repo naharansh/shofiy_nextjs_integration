@@ -1,3 +1,5 @@
+import type { WooCommerceOrder } from "@/lib/types"
+
 const WC_URL = process.env.WOOCOMMERCE_URL!
 const WC_CONSUMER_KEY = process.env.WOOCOMMERCE_CONSUMER_KEY!
 const WC_CONSUMER_SECRET = process.env.WOOCOMMERCE_CONSUMER_SECRET!
@@ -61,4 +63,25 @@ export async function createProductOnWooCommerce(data: {
     await res.json()
 
   return { id: product.id, title: product.name, permalink: product.permalink }
+}
+
+export async function fetchWooCommerceOrders(limit = 50) {
+  const url = `${WC_URL.replace(/\/+$/, "")}/wp-json/${API_VERSION}/orders?per_page=${limit}&orderby=date&order=desc`
+
+  const res = await fetch(url, {
+    headers: {
+      Authorization: getAuthHeader(),
+    },
+    cache: "no-store",
+  })
+
+  if (!res.ok) {
+    const errBody = await res.text()
+    throw new Error(
+      `WooCommerce API error (${res.status}): ${errBody.slice(0, 300)}`
+    )
+  }
+
+  const orders: WooCommerceOrder[] = await res.json()
+  return orders
 }

@@ -203,3 +203,64 @@ export const ADMIN_PRODUCT_QUERY = `#graphql
     }
   }
 `
+
+export const ADMIN_ORDERS_QUERY = `#graphql
+  query AdminOrders($first: Int!, $after: String) {
+    orders(first: $first, after: $after, sortKey: CREATED_AT, reverse: true) {
+      nodes {
+        id
+        name
+        createdAt
+        processedAt
+        displayFinancialStatus
+        displayFulfillmentStatus
+        totalPriceSet {
+          shopMoney {
+            amount
+            currencyCode
+          }
+        }
+        subtotalPriceSet {
+          shopMoney {
+            amount
+            currencyCode
+          }
+        }
+        totalTaxSet {
+          shopMoney {
+            amount
+            currencyCode
+          }
+        }
+        shippingAddress {
+          address1
+          address2
+          city
+          province
+          zip
+          country
+        }
+        lineItems(first: 20) {
+          nodes {
+            id
+            name
+            quantity
+            originalUnitPriceSet {
+              shopMoney {
+                amount
+                currencyCode
+              }
+            }
+            product {
+              id
+            }
+          }
+        }
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+`
