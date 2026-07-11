@@ -276,37 +276,80 @@ All errors are returned to the frontend as `{ error: "message" }` with the appro
 
 ---
 
-## 10. Known Limitations
+## 10. Order Status Updates (`PATCH /api/orders/[id]`)
 
-### 10.1. Product listing only shows Shopify products
+Orders can be updated via `PATCH /api/orders/[id]` with `platform: "odoo"` and a `fulfillmentStatus` value.
+
+### Fulfillment Status → Odoo State Mapping
+
+| `fulfillmentStatus` | Odoo Target State | Description                              |
+|---------------------|-------------------|------------------------------------------|
+| `UNFULFILLED`       | `sale`            | Confirms the quotation (`action_confirm`) |
+| `IN_PROGRESS`       | `draft`           | Keeps order as a quotation (no confirm)  |
+| `FULFILLED`         | `done` → `sale`   | Confirms the quotation (Odoo has no `done` state — effective target is `sale`) |
+
+### Allowed Odoo State Transitions
+
+Odoo only supports forward transitions on `sale.order`:
+
+| Current State | Allowed Transitions        | Odoo Method        |
+|---------------|----------------------------|---------------------|
+| `draft`       | `sale`, `done`, `cancel`   | `action_confirm`    |
+| `sent`        | `sale`, `done`, `cancel`   | `action_confirm`    |
+| `sale`        | `done`, `cancel`           | `write` / `action_cancel` |
+| `done`        | *(none — terminal)*        | —                   |
+| `cancel`      | *(none — terminal)*        | —                   |
+
+### Transition Behavior
+
+- **`draft`/`sent` → `sale` or `done`**: Calls `action_confirm` to confirm the quotation.
+- **`sale` → `done`**: No-op — the order is already at the effective target (`sale`).
+- **Any state → `cancel`**: Calls `action_cancel`.
+- **`done`/`cancel` → any state**: Rejected with an error (terminal states cannot be reversed).
+
+### Error Cases
+
+| Scenario | Error Message |
+|----------|---------------|
+| Order already in target state | Returns `success: true` (no-op) |
+| Order is `done`, target is `sale` | `"Cannot reverse a completed Odoo order..."` |
+| Order is `cancel`, any target | `"Cannot update a cancelled Odoo order..."` |
+| Invalid transition | `"Cannot transition Odoo order from X to Y..."` |
+| State update didn't take effect | `"Odoo order state update did not take effect..."` |
+
+---
+
+## 11. Known Limitations
+
+### 11.1. Product listing only shows Shopify products
 
 The homepage (`/`) fetches products from Shopify's Admin API. Odoo-created products do not appear in the grid. To view them, log into the Odoo backend directly.
 
-### 10.2. No unified product ID
+### 11.2. No unified product ID
 
 Shopify, WooCommerce, and Odoo use entirely different ID schemes. There is no cross-reference table linking products across platforms.
 
-### 10.3. Image upload requires outbound internet
+### 11.3. Image upload requires outbound internet
 
 The Odoo client downloads image URLs server-side via `fetch`. If the Odoo instance is on a private network, the image source URL must be reachable from the Next.js server.
 
-### 10.4. Session UID is cached in memory
+### 11.4. Session UID is cached in memory
 
 The authenticated UID is cached as a module-level variable. In serverless environments (Vercel, etc.), this cache may be per-instance and not persist across cold starts.
 
-### 10.5. Order access requires Sales user/group
+### 11.5. Order access requires Sales user/group
 
 The XML-RPC user must have **Sales / Administrator** or **Sales / User** access rights in Odoo to read `sale.order` records. Without this, `search_read` returns 0 records even though orders exist.
 
 **To fix:** Go to Odoo Settings → Users → [user] → Access Rights → Sales → set to "User" or "Administrator".
 
-### 10.6. Database name must match
+### 11.6. Database name must match
 
 The `ODOO_DB` environment variable must match the exact database name where your orders are stored. If `search_count` returns 0 despite orders being visible in the Odoo UI, the database name is likely wrong.
 
 ---
 
-## 11. Testing the Integration
+## 12. Testing the Integration
 
 ### With a local Odoo instance
 
@@ -351,7 +394,7 @@ Visit `http://localhost:3000/orders` and select the **Odoo** tab to see Odoo ord
 
 ---
 
-## 12. Odoo XML-RPC API Reference
+## 13. Odoo XML-RPC API Reference
 
 | Endpoint               | Common Methods                          |
 |------------------------|------------------------------------------|
@@ -381,7 +424,7 @@ Visit `http://localhost:3000/orders` and select the **Odoo** tab to see Odoo ord
 
 ---
 
-## 13. Quick Reference
+## 14. Quick Reference
 
 - [Odoo External API documentation](https://www.odoo.com/documentation/master/developer/reference/external_api.html)
 - Odoo XML-RPC endpoints:
