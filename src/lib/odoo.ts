@@ -162,6 +162,24 @@ export async function fetchOdooOrders(limit = 50) {
   }))
 }
 
+async function readOdooOrderState(orderId: number): Promise<string> {
+  const uid = await authenticate()
+  const client = getObjectClient()
+
+  const records = await methodCall<Array<{ state: string }>>(client, "execute_kw", [
+    ODOO_DB, uid, ODOO_PASSWORD,
+    "sale.order", "read",
+    [[orderId]],
+    { fields: ["state"] },
+  ])
+
+  if (!records || records.length === 0) {
+    throw new Error(`Odoo order ${orderId} not found`)
+  }
+
+  return records[0].state
+}
+
 export async function updateOdooOrderStatus(
   orderId: number,
   fulfillmentStatus: string
@@ -169,19 +187,75 @@ export async function updateOdooOrderStatus(
   const uid = await authenticate()
   const client = getObjectClient()
 
-  const statusMap: Record<string, string> = {
+  const currentState = await readOdooOrderState(orderId)
+
+  const validTransitions: Record<string, string[]> = {
+    draft: ["sale", "done", "cancel"],
+    sent: ["sale", "done", "cancel"],
+    sale: ["done", "cancel"],
+    done: [],
+    cancel: [],
+  }
+
+  const targetMap: Record<string, string> = {
     UNFULFILLED: "sale",
-    "IN_PROGRESS": "sale",
+    IN_PROGRESS: "draft",
     FULFILLED: "done",
   }
 
-  const newState = statusMap[fulfillmentStatus] || "sale"
+  const targetState = targetMap[fulfillmentStatus]
+  if (!targetState) {
+    throw new Error(`Unknown fulfillment status: ${fulfillmentStatus}`)
+  }
 
-  await methodCall<boolean>(client, "execute_kw", [
-    ODOO_DB, uid, ODOO_PASSWORD,
-    "sale.order", "write",
-    [[orderId], { state: newState }],
-  ])
+  if (currentState === targetState) {
+    return { success: true, status: fulfillmentStatus }
+  }
+
+  const effectiveTarget = targetState === "done" ? "sale" : targetState
+  if (currentState === effectiveTarget) {
+    return { success: true, status: fulfillmentStatus }
+  }
+
+  const allowed = validTransitions[currentState] || []
+  if (!allowed.includes(targetState)) {
+    if (currentState === "done" && targetState === "sale") {
+      throw new Error(
+        `Cannot reverse a completed Odoo order. Current state: ${currentState}. Odoo does not allow going from "done" back to "sale".`
+      )
+    }
+    if (currentState === "cancel") {
+      throw new Error(
+        `Cannot update a cancelled Odoo order. Current state: cancel.`
+      )
+    }
+    throw new Error(
+      `Cannot transition Odoo order from "${currentState}" to "${targetState}". Allowed transitions: ${allowed.join(", ") || "none"}`
+    )
+  }
+
+  const needsConfirm = currentState === "draft" || currentState === "sent"
+
+  if (targetState === "cancel") {
+    await methodCall<boolean>(client, "execute_kw", [
+      ODOO_DB, uid, ODOO_PASSWORD,
+      "sale.order", "action_cancel",
+      [[orderId]],
+    ])
+  } else if (needsConfirm) {
+    await methodCall<boolean>(client, "execute_kw", [
+      ODOO_DB, uid, ODOO_PASSWORD,
+      "sale.order", "action_confirm",
+      [[orderId]],
+    ])
+  }
+
+  const newState = await readOdooOrderState(orderId)
+  if (newState !== effectiveTarget) {
+    throw new Error(
+      `Odoo order state update did not take effect. Expected "${effectiveTarget}", got "${newState}".`
+    )
+  }
 
   return { success: true, status: fulfillmentStatus }
 }
