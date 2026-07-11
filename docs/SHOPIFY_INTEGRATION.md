@@ -46,7 +46,23 @@ SHOPIFY_ADMIN_ACCESS_TOKEN=your-admin-token
 | Storefront API token     | **Settings → Sales channels → Shopfront → API → Storefront API access tokens**            |
 | Admin API token          | **Apps → Develop apps → Create an app → Admin API → Configure scopes → Issue token**      |
 
-> **Admin API scopes needed**: `read_products`, `write_products`, `read_product_listings`, `write_product_listings`, `read_orders`
+> **Admin API scopes needed**:
+>
+> | Scope | Purpose |
+> |---|---|
+> | `read_products` | List/view products |
+> | `write_products` | Create/update/delete products |
+> | `read_product_listings` | Storefront product listings |
+> | `write_product_listings` | Publish products to sales channels |
+> | `read_orders` | Query orders |
+> | `read_merchant_managed_fulfillment_orders` | Read fulfillment orders for merchant-managed locations |
+> | `write_merchant_managed_fulfillment_orders` | Create fulfillments for merchant-managed locations |
+> | `read_assigned_fulfillment_orders` | Read fulfillment orders assigned to your app |
+> | `write_assigned_fulfillment_orders` | Create fulfillments for orders assigned to your app |
+> | `read_locations` | Query shop locations (needed for Draft Order fulfillment fallback) |
+> | `read_content` | Query shop info |
+>
+> **Important**: Without the `*_merchant_managed_fulfillment_orders` scopes, Shopify silently returns empty fulfillment order arrays instead of errors. This causes the legacy REST `POST /orders/{id}/fulfillments.json` path to be triggered, which returns `406 Not Acceptable` in API version `2024-10` and later.
 
 ---
 
@@ -539,7 +555,18 @@ Even with `export const dynamic = "force-dynamic"` on the page, `fetch` calls ar
 
 The Storefront API requires the API token to have the `write_publications` scope and the product must be published to a sales channel. Using the Admin API avoids this issue entirely.
 
-### 9.4. Image upload requires REST, not GraphQL
+### 9.4. Order fulfillment requires Fulfillment Orders API
+
+The legacy REST endpoint `POST /orders/{id}/fulfillments.json` returns `406 Not Acceptable` in API version `2024-10` and later. Use the **Fulfillment Orders** workflow instead:
+
+1. `GET /orders/{id}/fulfillment_orders.json` — get fulfillment orders with line items that have `fulfillable_quantity`
+2. `POST /fulfillments.json` — create the fulfillment using `line_items_by_fulfillment_order`
+
+See `updateShopifyFulfillment()` in `src/lib/shopify-admin.ts` for the implementation.
+
+> **Required scopes**: `read_merchant_managed_fulfillment_orders`, `write_merchant_managed_fulfillment_orders`, `read_assigned_fulfillment_orders`, `write_assigned_fulfillment_orders` must be added to the Admin API token. Without these scopes, `fulfillmentOrders` silently returns an empty array.
+
+### 9.5. Image upload requires REST, not GraphQL
 
 The GraphQL Admin API mutation `productCreateMedia` is unreliable for initial product creation. Use the REST endpoint:
 
@@ -568,3 +595,283 @@ npm start         # Serve production build
 - GraphQL endpoint formats:
   - Storefront: `https://{domain}/api/{version}/graphql.json`
   - Admin: `https://{domain}/admin/api/{version}/graphql.json`
+
+---
+
+## 12. Order Status Update
+
+This project supports updating a Shopify order's fulfillment status directly from the UI via the **Fulfillment Dropdown** on the Orders page and Homepage.
+
+> **Important**: Shopify's fulfillment model uses the **Fulfillment Orders API** (not the legacy REST `/fulfillments.json`). The legacy endpoint returns `406 Not Acceptable` in API version `2024-10` and later.
+
+---
+
+### 12.1 Required API Scopes
+
+Ensure the following scopes are enabled on your Admin API token:
+
+| Scope | Purpose |
+|---|---|
+| `read_orders` | Query orders and their fulfillment orders |
+| `read_merchant_managed_fulfillment_orders` | Read fulfillment orders for merchant-managed locations |
+| `write_merchant_managed_fulfillment_orders` | Create fulfillments via `fulfillmentCreate` |
+| `read_assigned_fulfillment_orders` | Read fulfillment orders assigned to your app |
+| `write_assigned_fulfillment_orders` | Create fulfillments for orders assigned to your app |
+| `read_locations` | Query shop locations (used in Draft Order fallback) |
+| `read_content` | Query shop info |
+
+In Shopify Admin: **Apps → Develop apps → [Your App] → Configuration → Admin API access scopes**.
+
+> **Critical**: Without `read_merchant_managed_fulfillment_orders` and `write_merchant_managed_fulfillment_orders`, the GraphQL `fulfillmentOrders` query silently returns an empty array instead of throwing an error. This makes it impossible to create fulfillments.
+
+---
+
+### 12.2 How Shopify Fulfillment Works (Two-Step Flow)
+
+Unlike WooCommerce (simple status field), marking a Shopify order as fulfilled requires two API calls:
+
+```
+Step 1 — Query fulfillment orders:
+  GraphQL: order(id: "gid://shopify/Order/{id}") → fulfillmentOrders → nodes
+
+Step 2 — Create a fulfillment:
+  mutation fulfillmentCreate(fulfillment: { lineItemsByFulfillmentOrder: [...] })
+```
+
+**Only `FULFILLED` triggers actual API calls.** `UNFULFILLED` and `IN_PROGRESS` return immediately without calling Shopify (Shopify has no direct "un-fulfill" mutation).
+
+#### Draft Order Fallback
+
+Orders created from Shopify Draft Orders often have **no fulfillment orders** via GraphQL. The code handles this with a two-pass approach:
+
+1. **Pass 1**: Query GraphQL `fulfillmentOrders` (works for standard checkout orders)
+2. **Pass 2** (fallback): Query REST `GET /orders/{id}/fulfillment_orders.json`, then create the fulfillment via REST `POST /fulfillments.json` using the new `line_items_by_fulfillment_order` format
+
+The REST fallback is required because:
+- The legacy `POST /orders/{id}/fulfillments.json` with `line_items` returns `406 Not Acceptable`
+- The new `POST /fulfillments.json` requires `line_items_by_fulfillment_order` with `fulfillment_order_id` values
+- Draft Orders may not have fulfillment orders visible via GraphQL due to scope restrictions
+
+---
+
+### 12.3 GraphQL Queries & Mutations (`src/lib/shopify-admin.ts`)
+
+#### Step 1 — Fetch Fulfillment Orders
+
+```graphql
+query GetFulfillmentOrders($orderId: ID!) {
+  order(id: $orderId) {
+    id
+    fulfillmentOrders(first: 10) {
+      nodes {
+        id
+        lineItems(first: 50) {
+          nodes {
+            id
+            lineItem {
+              id
+              quantity
+              fulfillableQuantity   # only items with > 0 can be fulfilled
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+#### Step 2 — Create Fulfillment
+
+```graphql
+mutation FulfillmentCreate($fulfillment: FulfillmentInput!) {
+  fulfillmentCreate(fulfillment: $fulfillment) {
+    fulfillment {
+      id
+      status
+    }
+    userErrors {
+      field
+      message
+    }
+  }
+}
+```
+
+Variables sent:
+
+```json
+{
+  "fulfillment": {
+    "notifyCustomer": false,
+    "lineItemsByFulfillmentOrder": [
+      {
+        "fulfillmentOrderId": "gid://shopify/FulfillmentOrder/123"
+      }
+    ]
+  }
+}
+```
+
+> **Note**: Omitting `fulfillmentOrderLineItems` fulfills **all** fulfillable items on the fulfillment order. This avoids the `lineItemId` vs `id` field naming issue with `FulfillmentOrderLineItemInput`.
+
+---
+
+### 12.4 Library Function (`src/lib/shopify-admin.ts`)
+
+```typescript
+export async function updateShopifyFulfillment(
+  orderId: string,          // Shopify GID string, e.g. "gid://shopify/Order/123" OR numeric string "123"
+  fulfillmentStatus: string // "UNFULFILLED" | "IN_PROGRESS" | "FULFILLED"
+): Promise<{ success: boolean; status: string }>
+```
+
+#### Status Behaviour
+
+| Unified Status | Shopify Action | Returns |
+|---|---|---|
+| `UNFULFILLED` | Cancels all active fulfillments via `fulfillmentCancel` GraphQL mutation | `{ success: true, status: "UNFULFILLED" }` |
+| `IN_PROGRESS` | **No API call** — display-only status | `{ success: true, status: "IN_PROGRESS" }` |
+| `FULFILLED` | Fetches fulfillment orders → creates fulfillment via GraphQL. Falls back to REST for Draft Orders. | `{ success: true, status: "FULFILLED" }` |
+
+#### Fulfillable Item Filtering
+
+Before creating a fulfillment the function filters out:
+- Fulfillment orders with **no fulfillable line items** (`fulfillableQuantity === 0`)
+- If all line items are already fulfilled, the function returns `{ success: true, status: "FULFILLED" }` without calling the mutation
+
+#### Error Handling
+
+```typescript
+if (result.fulfillmentCreate.userErrors?.length) {
+  throw new Error(
+    `Shopify fulfillment error: ${result.fulfillmentCreate.userErrors.map((e) => e.message).join("; ")}`
+  )
+}
+```
+
+---
+
+### 12.5 API Route (`src/app/api/orders/[id]/route.ts`)
+
+The `PATCH /api/orders/:id` endpoint is shared across all platforms.
+
+#### Request
+
+```http
+PATCH /api/orders/gid://shopify/Order/123
+Content-Type: application/json
+
+{
+  "platform": "shopify",
+  "fulfillmentStatus": "FULFILLED"
+}
+```
+
+> **Note**: For Shopify, the `id` in the URL path is passed directly to `updateShopifyFulfillment` as a string. The function builds the GID internally: the API route passes `params.id` (the raw URL segment) and the library prepends `gid://shopify/Order/` when querying.
+
+#### Validation (same as other platforms)
+
+| Rule | Error |
+|------|-------|
+| `platform` or `fulfillmentStatus` missing | `400 platform and fulfillmentStatus are required` |
+| `fulfillmentStatus` not in `["UNFULFILLED", "IN_PROGRESS", "FULFILLED"]` | `400 fulfillmentStatus must be UNFULFILLED, IN_PROGRESS, or FULFILLED` |
+
+#### Response
+
+```json
+{ "success": true, "status": "FULFILLED" }
+```
+
+---
+
+### 12.6 Frontend — FulfillmentDropdown (`src/components/FulfillmentDropdown.tsx`)
+
+The `<FulfillmentDropdown>` component is shared across all platforms (Shopify, WooCommerce, Odoo).
+
+#### Props (Shopify-specific notes)
+
+| Prop            | Type      | For Shopify                                           |
+|-----------------|-----------|-------------------------------------------------------|
+| `orderId`       | `string`  | The Shopify order GID or numeric ID from the URL      |
+| `platform`      | `string`  | `"shopify"`                                           |
+| `currentStatus` | `string \| null` | `displayFulfillmentStatus` from the GraphQL query |
+| `onStatusChange`| `function`| Optional callback after successful update             |
+
+#### Status Options & Display
+
+| Value         | Label       | Badge Color              | Shopify Equivalent              |
+|---------------|-------------|---------------------------|---------------------------------|
+| `UNFULFILLED` | Unfulfilled | Yellow (`bg-yellow-100`) | `UNFULFILLED` (no fulfillment)  |
+| `IN_PROGRESS` | In Progress | Blue (`bg-blue-100`)     | `IN_PROGRESS` (partial)         |
+| `FULFILLED`   | Fulfilled   | Green (`bg-green-100`)   | `FULFILLED` (all items shipped) |
+
+#### Optimistic UI
+
+1. Dropdown updates immediately to the selected value.
+2. `PATCH /api/orders/:id` fires in the background.
+3. On failure → dropdown reverts, inline error shown.
+4. On success → `onStatusChange` callback fires (if provided).
+5. Dropdown is disabled while the request is in-flight.
+
+---
+
+### 12.7 Known Limitations
+
+#### Only supports marking as FULFILLED
+
+`UNFULFILLED` and `IN_PROGRESS` are **no-ops** in Shopify — the function returns success without making any API call. Shopify does not expose a mutation to un-fulfill or partially revert a fulfillment.
+
+#### notifyCustomer is false
+
+Fulfillments are created with `notifyCustomer: false` by default. To send shipping notifications, update the `fulfillmentCreate` variables in `updateShopifyFulfillment()`.
+
+#### No tracking number support
+
+The current implementation does not attach a tracking number or carrier to the fulfillment. Extend the `FulfillmentInput` with `trackingInfo` if needed.
+
+---
+
+### 12.8 Testing the Status Update
+
+#### Via the UI
+
+1. Start the dev server: `npm run dev`
+2. Navigate to `http://localhost:3000/orders`
+3. Find a Shopify order row (look for the **Shopify** badge)
+4. Click the fulfillment status dropdown and select **Fulfilled**
+5. Verify the badge turns green; confirm in Shopify Admin under **Orders** that the fulfillment was created
+
+#### Direct API Test (cURL)
+
+```bash
+# Replace ORDER_ID with the numeric Shopify order ID (e.g. 5678)
+curl -X PATCH http://localhost:3000/api/orders/5678 \
+  -H "Content-Type: application/json" \
+  -d '{"platform":"shopify","fulfillmentStatus":"FULFILLED"}'
+```
+
+Expected response:
+
+```json
+{ "success": true, "status": "FULFILLED" }
+```
+
+#### Verify in Shopify Admin
+
+Go to **Orders → [Order name] → Fulfillments** — a new fulfillment entry should appear with status **Success**.
+
+---
+
+### 12.9 Error Scenarios
+
+| Scenario | Behaviour |
+|---|---|
+| Missing `read_merchant_managed_fulfillment_orders` scope | GraphQL `fulfillmentOrders` silently returns empty array → falls back to REST |
+| Missing `write_merchant_managed_fulfillment_orders` scope | `userErrors: [{ message: "Access denied" }]` → `500` from API route |
+| Legacy REST `POST /orders/{id}/fulfillments.json` | Returns `406 Not Acceptable` on API `2024-10`+ |
+| Draft Order with no fulfillment orders | REST fallback queries `GET /orders/{id}/fulfillment_orders.json` → creates fulfillment via `POST /fulfillments.json` |
+| All line items already fulfilled | Function returns `{ success: true, status: "FULFILLED" }` (idempotent) |
+| Order not found | `order` is `null` → function returns `{ success: true, status: "FULFILLED" }` (safe fallback) |
+| GraphQL `userErrors` present | `500` with `"Shopify fulfillment error: {message}"` |
+| Network failure | Dropdown reverts; inline error shown to user |

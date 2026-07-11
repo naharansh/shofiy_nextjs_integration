@@ -8,22 +8,24 @@ const ODOO_PASSWORD = process.env.ODOO_PASSWORD!
 
 let uidCache: number | null = null
 
-function getCommonClient() {
+function createOdooClient(path: string) {
   const url = new URL(ODOO_URL)
-  return xmlrpc.createClient({
+  const opts = {
     host: url.hostname,
-    port: url.port ? Number(url.port) : 8069,
-    path: "/xmlrpc/2/common",
-  })
+    port: url.port ? Number(url.port) : url.protocol === "https:" ? 443 : 8069,
+    path,
+  }
+  return url.protocol === "https:"
+    ? xmlrpc.createSecureClient(opts)
+    : xmlrpc.createClient(opts)
+}
+
+function getCommonClient() {
+  return createOdooClient("/xmlrpc/2/common")
 }
 
 function getObjectClient() {
-  const url = new URL(ODOO_URL)
-  return xmlrpc.createClient({
-    host: url.hostname,
-    port: url.port ? Number(url.port) : 8069,
-    path: "/xmlrpc/2/object",
-  })
+  return createOdooClient("/xmlrpc/2/object")
 }
 
 function methodCall<T>(
@@ -33,8 +35,17 @@ function methodCall<T>(
 ): Promise<T> {
   return new Promise((resolve, reject) => {
     client.methodCall(method, params, (error, value) => {
-      if (error) reject(new Error(`Odoo XML-RPC error: ${(error as Error).message}`))
-      else resolve(value as T)
+      if (error) {
+        const msg =
+          error instanceof Error
+            ? error.message
+            : typeof error === "string"
+              ? error
+              : JSON.stringify(error)
+        reject(new Error(`Odoo XML-RPC error: ${msg}`))
+      } else {
+        resolve(value as T)
+      }
     })
   })
 }
@@ -149,4 +160,28 @@ export async function fetchOdooOrders(limit = 50) {
     ...order,
     resolvedLines: order.order_line.flat().map((lineId: number) => lineMap[lineId]).filter(Boolean) as OdooOrderLine[],
   }))
+}
+
+export async function updateOdooOrderStatus(
+  orderId: number,
+  fulfillmentStatus: string
+): Promise<{ success: boolean; status: string }> {
+  const uid = await authenticate()
+  const client = getObjectClient()
+
+  const statusMap: Record<string, string> = {
+    UNFULFILLED: "sale",
+    "IN_PROGRESS": "sale",
+    FULFILLED: "done",
+  }
+
+  const newState = statusMap[fulfillmentStatus] || "sale"
+
+  await methodCall<boolean>(client, "execute_kw", [
+    ODOO_DB, uid, ODOO_PASSWORD,
+    "sale.order", "write",
+    [[orderId], { state: newState }],
+  ])
+
+  return { success: true, status: fulfillmentStatus }
 }

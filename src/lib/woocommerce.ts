@@ -85,3 +85,36 @@ export async function fetchWooCommerceOrders(limit = 50) {
   const orders: WooCommerceOrder[] = await res.json()
   return orders
 }
+
+export async function updateWooCommerceOrderStatus(
+  orderId: number,
+  fulfillmentStatus: string
+): Promise<{ success: boolean; status: string }> {
+  const statusMap: Record<string, string> = {
+    UNFULFILLED: "processing",
+    "IN_PROGRESS": "on-hold",
+    FULFILLED: "completed",
+  }
+
+  const wcStatus = statusMap[fulfillmentStatus] || "processing"
+  const url = `${WC_URL.replace(/\/+$/, "")}/wp-json/${API_VERSION}/orders/${orderId}`
+
+  const res = await fetch(url, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: getAuthHeader(),
+    },
+    body: JSON.stringify({ status: wcStatus }),
+  })
+
+  if (!res.ok) {
+    const errBody = await res.text()
+    throw new Error(
+      `WooCommerce API error (${res.status}): ${errBody.slice(0, 300)}`
+    )
+  }
+
+  const order: { id: number; status: string } = await res.json()
+  return { success: true, status: order.status.toUpperCase() }
+}

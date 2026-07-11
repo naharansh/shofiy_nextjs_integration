@@ -203,14 +203,18 @@ type WooCommerceOrder = {
 }
 ```
 
-### Order Status Mapping
+### Order Status Mapping (Read)
 
-| WooCommerce Status | Unified Status     |
-|--------------------|--------------------|
-| `processing`       | `PENDING`          |
-| `completed`        | `PAID` / `FULFILLED` |
-| `on-hold`          | `ON-HOLD`          |
-| `cancelled`        | `CANCELLED`        |
+When displaying orders, WooCommerce statuses are shown as-is in the UI. The `status` field on a `WooCommerceOrder` object maps to the following unified display values:
+
+| WooCommerce Status | Display Label  | Badge Color  |
+|--------------------|----------------|--------------|
+| `processing`       | Unfulfilled    | Yellow       |
+| `on-hold`          | In Progress    | Blue         |
+| `completed`        | Fulfilled      | Green        |
+| `cancelled`        | Cancelled      | Red          |
+| `pending`          | Pending        | Grey         |
+| `refunded`         | Refunded       | Purple       |
 
 ### Orders Page (`/orders`)
 
@@ -281,6 +285,7 @@ curl -X POST {WOOCOMMERCE_URL}/wp-json/wc/v3/products \
 | `DELETE` | `/wp-json/wc/v3/products/{id}`        | Delete product       |
 | `GET`    | `/wp-json/wc/v3/orders`               | List orders          |
 | `GET`    | `/wp-json/wc/v3/orders/{id}`          | Get single order     |
+| `PUT`    | `/wp-json/wc/v3/orders/{id}`          | Update order status  |
 
 ### Product fields commonly used
 
@@ -306,3 +311,164 @@ curl -X POST {WOOCOMMERCE_URL}/wp-json/wc/v3/products \
 - Authentication: Basic Auth (Consumer Key : Consumer Secret)
 - Default product type: `simple`
 - Default status: `publish`
+
+---
+
+## 13. Order Status Update
+
+This project supports updating a WooCommerce order's status directly from the UI via the **Fulfillment Dropdown** on the Orders page.
+
+---
+
+### 13.1 Library Function (`src/lib/woocommerce.ts`)
+
+```typescript
+export async function updateWooCommerceOrderStatus(
+  orderId: number,
+  fulfillmentStatus: string
+): Promise<{ success: boolean; status: string }>
+```
+
+The function maps a unified fulfillment status to a WooCommerce-native status and calls the WooCommerce REST API:
+
+```
+PUT {WOOCOMMERCE_URL}/wp-json/wc/v3/orders/{orderId}
+Authorization: Basic base64(consumer_key:consumer_secret)
+Content-Type: application/json
+
+{ "status": "<wc_status>" }
+```
+
+#### Status Mapping (Write)
+
+| Unified Status (app)  | WooCommerce Status (API) | Meaning                        |
+|-----------------------|--------------------------|--------------------------------|
+| `UNFULFILLED`         | `processing`             | Order received, not shipped    |
+| `IN_PROGRESS`         | `on-hold`                | Awaiting further action        |
+| `FULFILLED`           | `completed`              | Shipped / delivered            |
+| *(fallback)*          | `processing`             | Any unrecognized value         |
+
+On success, the function returns:
+
+```json
+{ "success": true, "status": "COMPLETED" }
+```
+
+The `status` field in the response is the WooCommerce status returned by the API, uppercased.
+
+---
+
+### 13.2 API Route (`src/app/api/orders/[id]/route.ts`)
+
+The `PATCH /api/orders/:id` endpoint handles status updates for all platforms.
+
+#### Request
+
+```http
+PATCH /api/orders/456
+Content-Type: application/json
+
+{
+  "platform": "woocommerce",
+  "fulfillmentStatus": "FULFILLED"
+}
+```
+
+#### Validation
+
+| Rule | Error |
+|------|-------|
+| `platform` missing | `400 platform and fulfillmentStatus are required` |
+| `fulfillmentStatus` missing | `400 platform and fulfillmentStatus are required` |
+| `fulfillmentStatus` not in allowed set | `400 fulfillmentStatus must be UNFULFILLED, IN_PROGRESS, or FULFILLED` |
+| Unknown platform | `400 Unsupported platform: <value>` |
+
+#### Routing Logic
+
+```typescript
+if (platform === "shopify") {
+  result = await updateShopifyFulfillment(params.id, fulfillmentStatus)
+} else if (platform === "woocommerce") {
+  result = await updateWooCommerceOrderStatus(Number(params.id), fulfillmentStatus)
+} else if (platform === "odoo") {
+  result = await updateOdooOrderStatus(Number(params.id), fulfillmentStatus)
+}
+```
+
+#### Response
+
+```json
+{ "success": true, "status": "COMPLETED" }
+```
+
+---
+
+### 13.3 Frontend — FulfillmentDropdown (`src/components/FulfillmentDropdown.tsx`)
+
+The `<FulfillmentDropdown>` is a client component rendered inline in each order row on the Orders page and Homepage.
+
+#### Props
+
+| Prop            | Type                                    | Description                                  |
+|-----------------|-----------------------------------------|----------------------------------------------|
+| `orderId`       | `string`                                | WooCommerce order ID (numeric, as string)    |
+| `platform`      | `"shopify" \| "woocommerce" \| "odoo"` | Controls which API path is used              |
+| `currentStatus` | `string \| null`                        | Current WooCommerce status (e.g. `processing`)|
+| `onStatusChange`| `(newStatus: string) => void` (optional)| Callback fired after a successful update     |
+
+#### Available Status Options
+
+| Value         | Label       | Badge Color              |
+|---------------|-------------|---------------------------|
+| `UNFULFILLED` | Unfulfilled | Yellow (`bg-yellow-100`) |
+| `IN_PROGRESS` | In Progress | Blue (`bg-blue-100`)     |
+| `FULFILLED`   | Fulfilled   | Green (`bg-green-100`)   |
+
+#### Optimistic UI Behaviour
+
+1. The dropdown updates immediately (optimistic update).
+2. A `PATCH /api/orders/:id` request is sent in the background.
+3. If the request fails, the dropdown reverts to the previous status and shows an inline error message.
+4. While the request is in flight, the dropdown is disabled (`opacity-50`).
+
+---
+
+### 13.4 Error Handling
+
+| Scenario                          | Behaviour                                                          |
+|-----------------------------------|--------------------------------------------------------------------|
+| WooCommerce returns non-2xx       | Error thrown: `"WooCommerce API error ({status}): {body}"`         |
+| Invalid credentials               | WooCommerce returns `401`; error propagated to client              |
+| Order not found                   | WooCommerce returns `404`; error propagated to client              |
+| Unsupported `fulfillmentStatus`   | API route returns `400` before calling WooCommerce                 |
+| Network failure                   | Dropdown reverts; inline error shown to user                       |
+
+---
+
+### 13.5 Testing the Status Update
+
+#### Via the UI
+
+1. Start the dev server: `npm run dev`
+2. Navigate to `http://localhost:3000/orders`
+3. Find a WooCommerce order row (look for the **WooCommerce** badge)
+4. Click the fulfillment status dropdown and select a new value
+5. Verify the badge updates immediately; confirm in WooCommerce admin that the order status changed
+
+#### Direct API Test (cURL)
+
+```bash
+curl -X PATCH http://localhost:3000/api/orders/456 \
+  -H "Content-Type: application/json" \
+  -d '{"platform":"woocommerce","fulfillmentStatus":"FULFILLED"}'
+```
+
+Expected response:
+
+```json
+{ "success": true, "status": "COMPLETED" }
+```
+
+#### Verify in WordPress
+
+In WordPress admin, go to **WooCommerce → Orders** and confirm the order status changed to **Completed**.

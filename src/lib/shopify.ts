@@ -1,6 +1,6 @@
 const SHOPIFY_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN!
 const STOREFRONT_TOKEN = process.env.SHOPIFY_STOREFRONT_ACCESS_TOKEN!
-const API_VERSION = "2024-10"
+const API_VERSION = "2025-10"
 
 const endpoint = `https://${SHOPIFY_DOMAIN}/api/${API_VERSION}/graphql.json`
 

@@ -7,6 +7,7 @@ import type { AdminOrdersResponse, ShopifyOrder, WooCommerceOrder, OdooOrder, Od
 import Link from "next/link"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
+import FulfillmentDropdown from "@/components/FulfillmentDropdown"
 
 function formatCurrency(amount: string, currency: string) {
   return new Intl.NumberFormat("en-US", {
@@ -121,17 +122,17 @@ function OrderCard({ order }: { order: UnifiedOrder }) {
             <p className="font-semibold">{formatCurrency(order.total.amount, order.total.currencyCode)}</p>
             <div className="mt-1 flex gap-1">
               <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${
-                order.status === "PAID" || order.status === "COMPLETED"
+                order.status === "PAID" || order.status === "COMPLETED" || order.status === "SALE" || order.status === "DONE"
                   ? "bg-green-100 text-green-800"
                   : "bg-yellow-100 text-yellow-800"
               }`}>
                 {order.status}
               </span>
-              {order.fulfillmentStatus && (
-                <span className="rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-800">
-                  {order.fulfillmentStatus}
-                </span>
-              )}
+              <FulfillmentDropdown
+                orderId={order.id}
+                platform={order.platform}
+                currentStatus={order.fulfillmentStatus}
+              />
             </div>
           </div>
         </div>
