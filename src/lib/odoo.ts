@@ -1,72 +1,41 @@
-import xmlrpc from "xmlrpc"
 import type { OdooOrder, OdooOrderLine } from "@/lib/types"
 
 const ODOO_URL = process.env.ODOO_URL!
-const ODOO_DB = process.env.ODOO_DB!
-const ODOO_USERNAME = process.env.ODOO_USERNAME!
-const ODOO_PASSWORD = process.env.ODOO_PASSWORD!
+const ODOO_API_KEY = process.env.ODOO_API_KEY!
 
-let uidCache: number | null = null
+function getBaseUrl() {
+  return ODOO_URL.replace(/\/+$/, "")
+}
 
-function createOdooClient(path: string) {
-  const url = new URL(ODOO_URL)
-  const opts = {
-    host: url.hostname,
-    port: url.port ? Number(url.port) : url.protocol === "https:" ? 443 : 8069,
-    path,
+function getAuthHeaders() {
+  return {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${ODOO_API_KEY}`,
   }
-  return url.protocol === "https:"
-    ? xmlrpc.createSecureClient(opts)
-    : xmlrpc.createClient(opts)
 }
 
-function getCommonClient() {
-  return createOdooClient("/xmlrpc/2/common")
-}
-
-function getObjectClient() {
-  return createOdooClient("/xmlrpc/2/object")
-}
-
-function methodCall<T>(
-  client: xmlrpc.Client,
-  method: string,
-  params: unknown[]
+async function odooFetch<T>(
+  path: string,
+  options: RequestInit = {}
 ): Promise<T> {
-  return new Promise((resolve, reject) => {
-    client.methodCall(method, params, (error, value) => {
-      if (error) {
-        const msg =
-          error instanceof Error
-            ? error.message
-            : typeof error === "string"
-              ? error
-              : JSON.stringify(error)
-        reject(new Error(`Odoo XML-RPC error: ${msg}`))
-      } else {
-        resolve(value as T)
-      }
-    })
+  const url = `${getBaseUrl()}${path}`
+  const res = await fetch(url, {
+    ...options,
+    headers: {
+      ...getAuthHeaders(),
+      ...options.headers,
+    },
+    cache: "no-store",
   })
-}
 
-export async function authenticate(): Promise<number> {
-  if (uidCache) return uidCache
-
-  const client = getCommonClient()
-  const uid = await methodCall<number>(client, "authenticate", [
-    ODOO_DB,
-    ODOO_USERNAME,
-    ODOO_PASSWORD,
-    {},
-  ])
-
-  if (!uid || uid === 0) {
-    throw new Error("Odoo authentication failed – invalid credentials")
+  if (!res.ok) {
+    const body = await res.text()
+    throw new Error(
+      `Odoo shopfify API error (${res.status}): ${body.slice(0, 300)}`
+    )
   }
 
-  uidCache = uid
-  return uid
+  return res.json() as Promise<T>
 }
 
 export async function createProductOnOdoo(data: {
@@ -75,187 +44,165 @@ export async function createProductOnOdoo(data: {
   price?: string
   imageUrl?: string
   imageAlt?: string
+  externalId?: string
 }) {
-  const uid = await authenticate()
-  const client = getObjectClient()
-
-  const fields: Record<string, unknown> = {
-    name: data.title,
-    type: "consu",
-    sale_ok: true,
-    purchase_ok: true,
+  const body: Record<string, unknown> = {
+    title: data.title,
   }
 
   if (data.descriptionHtml) {
-    fields["description"] = data.descriptionHtml
-    fields["description_sale"] = data.descriptionHtml
+    body.description = data.descriptionHtml
   }
 
   if (data.price) {
-    fields["list_price"] = Number(data.price)
+    body.price = Number(data.price)
   }
-
-  const productId = await methodCall<number>(client, "execute_kw", [
-    ODOO_DB,
-    uid,
-    ODOO_PASSWORD,
-    "product.template",
-    "create",
-    [fields],
-  ])
 
   if (data.imageUrl) {
-    try {
-      const imgRes = await fetch(data.imageUrl)
-      const imgBuffer = Buffer.from(await imgRes.arrayBuffer())
-      const base64 = imgBuffer.toString("base64")
-
-      await methodCall<number>(client, "execute_kw", [
-        ODOO_DB,
-        uid,
-        ODOO_PASSWORD,
-        "product.template",
-        "write",
-        [[productId], { image_1920: base64 }],
-      ])
-    } catch {
-      console.warn("Failed to upload image to Odoo, product created without image")
-    }
+    body.imageUrl = data.imageUrl
   }
 
-  return { id: productId, title: data.title }
+  if (data.externalId) {
+    body.externalId = data.externalId
+  }
+
+  const result = await odooFetch<{ id: number; title: string }>(
+    "/shopfify/api/products",
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+    }
+  )
+
+  return { id: result.id, title: result.title }
+}
+
+export async function updateProductOnOdoo(
+  odooProductId: number,
+  data: {
+    title: string
+    descriptionHtml?: string
+    price?: string
+    imageUrl?: string
+  }
+) {
+  const body: Record<string, unknown> = {}
+
+  if (data.title) {
+    body.title = data.title
+  }
+
+  if (data.descriptionHtml !== undefined) {
+    body.description = data.descriptionHtml
+  }
+
+  if (data.price !== undefined && data.price !== "") {
+    body.price = Number(data.price)
+  }
+
+  if (data.imageUrl) {
+    body.imageUrl = data.imageUrl
+  }
+
+  const result = await odooFetch<{ id: number; title: string }>(
+    `/shopfify/api/products/${odooProductId}`,
+    {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }
+  )
+
+  return { id: result.id, title: result.title }
+}
+
+export async function searchProductsOnOdoo(title: string) {
+  const params = new URLSearchParams({ search: title, limit: "10" })
+  const result = await odooFetch<{
+    products: Array<{ id: number; title: string; price: number; description: string }>
+  }>(`/shopfify/api/products?${params}`)
+
+  return result.products.filter(
+    (p) => p.title.toLowerCase() === title.toLowerCase()
+  )
+}
+
+export async function deleteProductOnOdoo(odooProductId: number) {
+  await odooFetch<{ success: boolean }>(
+    `/shopfify/api/products/${odooProductId}`,
+    { method: "DELETE" }
+  )
+
+  return { success: true }
 }
 
 export async function fetchOdooOrders(limit = 50) {
-  const uid = await authenticate()
-  const client = getObjectClient()
+  const params = new URLSearchParams({ limit: String(limit) })
+  const result = await odooFetch<{ orders: OdooOrderRestResponse[] }>(
+    `/shopfify/api/orders?${params}`
+  )
 
-  const orders = await methodCall<OdooOrder[]>(client, "execute_kw", [
-    ODOO_DB, uid, ODOO_PASSWORD,
-    "sale.order", "search_read",
-    [[]],
-    {
-      fields: ["name", "state", "date_order", "amount_total", "amount_untaxed", "currency_id", "partner_id", "partner_shipping_id", "order_line"],
-      order: "date_order desc",
-      limit,
-    },
-  ])
+  if (!result.orders || result.orders.length === 0) return []
 
-  if (orders.length === 0) return []
-
-  const allLineIds = orders.flatMap((o) => o.order_line.flat())
-  let lineMap: Record<number, OdooOrderLine> = {}
-
-  if (allLineIds.length > 0) {
-    const lines = await methodCall<OdooOrderLine[]>(client, "execute_kw", [
-      ODOO_DB, uid, ODOO_PASSWORD,
-      "sale.order.line", "read",
-      [allLineIds],
-      { fields: ["name", "product_uom_qty", "price_unit", "price_subtotal"] },
-    ])
-    lineMap = Object.fromEntries(lines.map((l) => [l.id, l]))
-  }
-
-  return orders.map((order) => ({
-    ...order,
-    resolvedLines: order.order_line.flat().map((lineId: number) => lineMap[lineId]).filter(Boolean) as OdooOrderLine[],
+  return result.orders.map((order) => ({
+    id: order.id,
+    name: order.name,
+    state: order.state,
+    date_order: order.date_order,
+    amount_total: order.amount_total,
+    amount_untaxed: order.amount_untaxed,
+    currency_id: order.currency_id,
+    partner_id: order.partner_id,
+    partner_shipping_id: order.partner_shipping_id,
+    order_line: order.order_line.map((line) => [line.id]),
+    resolvedLines: order.order_line as unknown as OdooOrderLine[],
   }))
-}
-
-async function readOdooOrderState(orderId: number): Promise<string> {
-  const uid = await authenticate()
-  const client = getObjectClient()
-
-  const records = await methodCall<Array<{ state: string }>>(client, "execute_kw", [
-    ODOO_DB, uid, ODOO_PASSWORD,
-    "sale.order", "read",
-    [[orderId]],
-    { fields: ["state"] },
-  ])
-
-  if (!records || records.length === 0) {
-    throw new Error(`Odoo order ${orderId} not found`)
-  }
-
-  return records[0].state
 }
 
 export async function updateOdooOrderStatus(
   orderId: number,
   fulfillmentStatus: string
 ): Promise<{ success: boolean; status: string }> {
-  const uid = await authenticate()
-  const client = getObjectClient()
-
-  const currentState = await readOdooOrderState(orderId)
-
-  const validTransitions: Record<string, string[]> = {
-    draft: ["sale", "done", "cancel"],
-    sent: ["sale", "done", "cancel"],
-    sale: ["done", "cancel"],
-    done: [],
-    cancel: [],
-  }
-
-  const targetMap: Record<string, string> = {
+  const stateMap: Record<string, string> = {
     UNFULFILLED: "sale",
     IN_PROGRESS: "draft",
     FULFILLED: "done",
   }
 
-  const targetState = targetMap[fulfillmentStatus]
+  const targetState = stateMap[fulfillmentStatus]
   if (!targetState) {
     throw new Error(`Unknown fulfillment status: ${fulfillmentStatus}`)
   }
 
-  if (currentState === targetState) {
-    return { success: true, status: fulfillmentStatus }
-  }
-
-  const effectiveTarget = targetState === "done" ? "sale" : targetState
-  if (currentState === effectiveTarget) {
-    return { success: true, status: fulfillmentStatus }
-  }
-
-  const allowed = validTransitions[currentState] || []
-  if (!allowed.includes(targetState)) {
-    if (currentState === "done" && targetState === "sale") {
-      throw new Error(
-        `Cannot reverse a completed Odoo order. Current state: ${currentState}. Odoo does not allow going from "done" back to "sale".`
-      )
+  const result = await odooFetch<{ success: boolean; state: string }>(
+    `/shopfify/api/orders/${orderId}`,
+    {
+      method: "PUT",
+      body: JSON.stringify({ state: targetState }),
     }
-    if (currentState === "cancel") {
-      throw new Error(
-        `Cannot update a cancelled Odoo order. Current state: cancel.`
-      )
-    }
-    throw new Error(
-      `Cannot transition Odoo order from "${currentState}" to "${targetState}". Allowed transitions: ${allowed.join(", ") || "none"}`
-    )
-  }
+  )
 
-  const needsConfirm = currentState === "draft" || currentState === "sent"
-
-  if (targetState === "cancel") {
-    await methodCall<boolean>(client, "execute_kw", [
-      ODOO_DB, uid, ODOO_PASSWORD,
-      "sale.order", "action_cancel",
-      [[orderId]],
-    ])
-  } else if (needsConfirm) {
-    await methodCall<boolean>(client, "execute_kw", [
-      ODOO_DB, uid, ODOO_PASSWORD,
-      "sale.order", "action_confirm",
-      [[orderId]],
-    ])
-  }
-
-  const newState = await readOdooOrderState(orderId)
-  if (newState !== effectiveTarget) {
-    throw new Error(
-      `Odoo order state update did not take effect. Expected "${effectiveTarget}", got "${newState}".`
-    )
+  if (!result.success) {
+    throw new Error(`Failed to update Odoo order ${orderId} status`)
   }
 
   return { success: true, status: fulfillmentStatus }
+}
+
+type OdooOrderRestResponse = {
+  id: number
+  name: string
+  state: string
+  date_order: string
+  amount_total: number
+  amount_untaxed: number
+  currency_id: [number, string]
+  partner_id: [number, string] | false
+  partner_shipping_id: [number, string] | false
+  order_line: Array<{
+    id: number
+    name: string
+    product_uom_qty: number
+    price_unit: number
+    price_subtotal: number
+  }>
 }

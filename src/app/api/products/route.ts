@@ -6,7 +6,7 @@ import {
   PRODUCT_VARIANTS_QUERY,
   ADMIN_PRODUCT_QUERY,
 } from "@/lib/shopify-admin"
-import { createProductOnOdoo } from "@/lib/odoo"
+import { createProductOnOdoo, searchProductsOnOdoo } from "@/lib/odoo"
 import { createProductOnWooCommerce } from "@/lib/woocommerce"
 import type { AdminProductResponse } from "@/lib/types"
 
@@ -35,11 +35,22 @@ export async function GET(request: Request) {
     const numericId = productByHandle.id.split("/").pop()
     const price = productByHandle.variants.nodes[0]?.price
 
+    let odooProductId: number | null = null
+    try {
+      const matches = await searchProductsOnOdoo(productByHandle.title)
+      if (matches.length > 0) {
+        odooProductId = matches[0].id
+      }
+    } catch {
+      // Odoo lookup is non-fatal
+    }
+
     return NextResponse.json({
       numericId,
       title: productByHandle.title,
       descriptionHtml: productByHandle.descriptionHtml,
       price,
+      odooProductId,
     })
   } catch (error) {
     const message =

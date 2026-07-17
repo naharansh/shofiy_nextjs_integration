@@ -9,6 +9,12 @@ import { Textarea } from "@/components/ui/textarea"
 import { Label } from "@/components/ui/label"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 
+type PlatformResult = {
+  success: boolean
+  product?: Record<string, unknown>
+  error?: string
+}
+
 export default function EditProductPage() {
   const router = useRouter()
   const params = useParams()
@@ -21,6 +27,8 @@ export default function EditProductPage() {
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState("")
   const [numericId, setNumericId] = useState("")
+  const [odooProductId, setOdooProductId] = useState<number | null>(null)
+  const [results, setResults] = useState<Record<string, PlatformResult> | null>(null)
 
   useEffect(() => {
     async function load() {
@@ -32,6 +40,7 @@ export default function EditProductPage() {
         setDescription(data.descriptionHtml || "")
         setPrice(data.price || "")
         setNumericId(data.numericId)
+        setOdooProductId(data.odooProductId ?? null)
       } catch {
         setError("Failed to load product")
       } finally {
@@ -45,6 +54,7 @@ export default function EditProductPage() {
     e.preventDefault()
     setSubmitting(true)
     setError("")
+    setResults(null)
 
     try {
       const res = await fetch(`/api/products/${numericId}`, {
@@ -54,6 +64,7 @@ export default function EditProductPage() {
           title,
           descriptionHtml: description,
           price: price || undefined,
+          odooProductId,
         }),
       })
 
@@ -64,7 +75,17 @@ export default function EditProductPage() {
         return
       }
 
-      router.push(`/products/${data.product.handle}`)
+      if (data.results) {
+        setResults(data.results)
+        const allSucceeded = Object.values(
+          data.results as Record<string, PlatformResult>
+        ).every((r) => r.success)
+        if (allSucceeded) {
+          setTimeout(() => router.push(`/products/${handle}`), 1500)
+        }
+      } else {
+        router.push(`/products/${handle}`)
+      }
     } catch {
       setError("Something went wrong")
     } finally {
@@ -137,6 +158,36 @@ export default function EditProductPage() {
           </form>
         </CardContent>
       </Card>
+
+      {results && (
+        <Card className="mt-4">
+          <CardHeader>
+            <CardTitle>Results</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-2">
+              {Object.entries(results).map(([platform, r]) => (
+                <div
+                  key={platform}
+                  className={`rounded-md border px-4 py-3 text-sm ${
+                    r.success
+                      ? "border-green-200 bg-green-50 text-green-800"
+                      : "border-red-200 bg-red-50 text-red-800"
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="font-medium capitalize">{platform}</span>
+                    <span>{r.success ? "Updated" : "Failed"}</span>
+                  </div>
+                  {r.error && (
+                    <p className="mt-1 text-xs opacity-75">{r.error}</p>
+                  )}
+                </div>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      )}
     </main>
   )
 }

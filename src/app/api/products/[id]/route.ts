@@ -6,13 +6,21 @@ import {
   UPDATE_VARIANT_MUTATION,
   PRODUCT_VARIANTS_QUERY,
 } from "@/lib/shopify-admin"
+import { updateProductOnOdoo } from "@/lib/odoo"
+
+type PlatformResult = {
+  success: boolean
+  product?: Record<string, unknown>
+  error?: string
+}
 
 export async function PUT(
   request: Request,
   { params }: { params: { id: string } }
 ) {
   try {
-    const { title, descriptionHtml, price } = await request.json()
+    const { title, descriptionHtml, price, odooProductId } =
+      await request.json()
     const id = `gid://shopify/Product/${params.id}`
 
     if (!title) {
@@ -22,70 +30,101 @@ export async function PUT(
       )
     }
 
-    const result = await shopifyAdminFetch<{
-      productUpdate: {
-        product: { id: string; title: string; handle: string } | null
-        userErrors: Array<{ field: string; message: string }>
-      }
-    }>({
-      query: UPDATE_PRODUCT_MUTATION,
-      variables: {
-        input: {
-          id,
-          title,
-          descriptionHtml: descriptionHtml || "",
-        },
-      },
-    })
+    const results: Record<string, PlatformResult> = {}
 
-    const { productUpdate } = result
-
-    if (productUpdate.userErrors.length > 0) {
-      return NextResponse.json(
-        { error: productUpdate.userErrors.map((e) => e.message).join(", ") },
-        { status: 400 }
-      )
-    }
-
-    if (price !== undefined && price !== "") {
-      const { product: existing } = await shopifyAdminFetch<{
-        product: {
-          variants: { nodes: Array<{ id: string; price: string }> }
+    // Shopify update
+    try {
+      const result = await shopifyAdminFetch<{
+        productUpdate: {
+          product: { id: string; title: string; handle: string } | null
+          userErrors: Array<{ field: string; message: string }>
         }
       }>({
-        query: PRODUCT_VARIANTS_QUERY,
-        variables: { productId: id },
+        query: UPDATE_PRODUCT_MUTATION,
+        variables: {
+          input: {
+            id,
+            title,
+            descriptionHtml: descriptionHtml || "",
+          },
+        },
       })
 
-      const variantId = existing?.variants?.nodes?.[0]?.id
+      const { productUpdate } = result
 
-      if (variantId && String(existing.variants.nodes[0].price) !== String(price)) {
-        const varResult = await shopifyAdminFetch<{
-          productVariantsBulkUpdate: {
-            userErrors: Array<{ field: string; message: string }>
+      if (productUpdate.userErrors.length > 0) {
+        throw new Error(
+          productUpdate.userErrors.map((e) => e.message).join(", ")
+        )
+      }
+
+      if (price !== undefined && price !== "") {
+        const { product: existing } = await shopifyAdminFetch<{
+          product: {
+            variants: { nodes: Array<{ id: string; price: string }> }
           }
         }>({
-          query: UPDATE_VARIANT_MUTATION,
-          variables: {
-            productId: id,
-            variants: [{ id: variantId, price: String(price) }],
-          },
+          query: PRODUCT_VARIANTS_QUERY,
+          variables: { productId: id },
         })
 
-        if (varResult.productVariantsBulkUpdate.userErrors.length > 0) {
-          return NextResponse.json(
-            {
-              error: varResult.productVariantsBulkUpdate.userErrors
-                .map((e) => e.message)
-                .join(", "),
+        const variantId = existing?.variants?.nodes?.[0]?.id
+
+        if (
+          variantId &&
+          String(existing.variants.nodes[0].price) !== String(price)
+        ) {
+          const varResult = await shopifyAdminFetch<{
+            productVariantsBulkUpdate: {
+              userErrors: Array<{ field: string; message: string }>
+            }
+          }>({
+            query: UPDATE_VARIANT_MUTATION,
+            variables: {
+              productId: id,
+              variants: [{ id: variantId, price: String(price) }],
             },
-            { status: 400 }
-          )
+          })
+
+          if (varResult.productVariantsBulkUpdate.userErrors.length > 0) {
+            throw new Error(
+              varResult.productVariantsBulkUpdate.userErrors
+                .map((e) => e.message)
+                .join(", ")
+            )
+          }
+        }
+      }
+
+      results.shopify = {
+        success: true,
+        ...(productUpdate.product && { product: productUpdate.product }),
+      }
+    } catch (error) {
+      results.shopify = {
+        success: false,
+        error: error instanceof Error ? error.message : "Shopify update failed",
+      }
+    }
+
+    // Odoo update
+    if (odooProductId) {
+      try {
+        const product = await updateProductOnOdoo(Number(odooProductId), {
+          title,
+          descriptionHtml,
+          price,
+        })
+        results.odoo = { success: true, product }
+      } catch (error) {
+        results.odoo = {
+          success: false,
+          error: error instanceof Error ? error.message : "Odoo update failed",
         }
       }
     }
 
-    return NextResponse.json({ product: productUpdate.product })
+    return NextResponse.json({ results })
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "Something went wrong"
